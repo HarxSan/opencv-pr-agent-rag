@@ -1,0 +1,8 @@
+flask==2.3.3
+gunicorn==23.0.0
+requests==2.32.3
+qdrant-client==1.12.1
+sentence-transformers==3.3.1
+torch==2.5.1
+transformers==4.46.3
+pr-agent

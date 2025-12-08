@@ -1,0 +1,99 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: opencv-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    networks:
+      - opencv-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    container_name: opencv-indexer
+    volumes:
+      - ${OPENCV_REPO_PATH:?OPENCV_REPO_PATH is required}:/app/opencv_repo:ro
+      - ./data/logs:/app/logs
+      - ./data/cache:/app/cache
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-opencv_codebase}
+      - OPENCV_REPO_PATH=/app/opencv_repo
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/graphcodebert-base}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    networks:
+      - opencv-network
+    profiles:
+      - indexer
+
+  pr-agent-rag:
+    build:
+      context: ./webhook-server
+      dockerfile: Dockerfile
+    container_name: opencv-pr-agent-rag
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/cache:/app/cache
+      - ./secrets:/app/secrets:ro
+    environment:
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_PRIVATE_KEY_PATH=/app/secrets/github-app-private-key.pem
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - GITHUB_USER_TOKEN=${GITHUB_USER_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-HarxSan/opencv}
+      - LIGHTNING_AI_ENDPOINT=${LIGHTNING_AI_ENDPOINT:-https://3000-01kbs5g1xhxxrzv5rh00t479a4.cloudspaces.litng.ai}
+      - LIGHTNING_AI_MODEL_NAME=${LIGHTNING_AI_MODEL_NAME:-qwen2.5-coder-7b-instruct}
+      - LIGHTNING_AI_API_KEY=${LIGHTNING_AI_API_KEY:-not-used}
+      - MODEL_MAX_TOKENS=${MODEL_MAX_TOKENS:-32000}
+      - MODEL_TEMPERATURE=${MODEL_TEMPERATURE:-0.3}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-opencv_codebase}
+      - RAG_TOP_K=${RAG_TOP_K:-15}
+      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.4}
+      - RAG_MAX_CONTEXT_TOKENS=${RAG_MAX_CONTEXT_TOKENS:-12000}
+      - RAG_ENABLED_COMMANDS=${RAG_ENABLED_COMMANDS:-review,improve,ask}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/graphcodebert-base}
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_DIFF_SIZE=${MAX_DIFF_SIZE:-10485760}
+      - MAX_FILES_PER_PR=${MAX_FILES_PER_PR:-500}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-600}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    networks:
+      - opencv-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+networks:
+  opencv-network:
+    driver: bridge
