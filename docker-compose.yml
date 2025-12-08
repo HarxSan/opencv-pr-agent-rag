@@ -10,6 +10,8 @@ services:
     environment:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
       - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS=2
+      - QDRANT__STORAGE__OPTIMIZERS__INDEXING_THRESHOLD_KB=0
     networks:
       - opencv-network
     restart: unless-stopped
@@ -35,7 +37,7 @@ services:
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-opencv_codebase}
       - OPENCV_REPO_PATH=/app/opencv_repo
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/graphcodebert-base}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -74,7 +76,7 @@ services:
       - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.4}
       - RAG_MAX_CONTEXT_TOKENS=${RAG_MAX_CONTEXT_TOKENS:-12000}
       - RAG_ENABLED_COMMANDS=${RAG_ENABLED_COMMANDS:-review,improve,ask}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/graphcodebert-base}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=5000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -92,7 +94,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 300s
 
 networks:
   opencv-network:

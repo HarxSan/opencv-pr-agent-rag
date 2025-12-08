@@ -1,8 +1,10 @@
-flask==2.3.3
+flask==3.1.0
 gunicorn==23.0.0
 requests==2.32.3
+PyGithub==2.5.0
+python-dotenv==1.0.1
+pydantic==2.10.3
 qdrant-client==1.12.1
 sentence-transformers==3.3.1
-torch==2.5.1
-transformers==4.46.3
-pr-agent
+torch>=2.1.0
+transformers>=4.40.0

@@ -3,13 +3,17 @@ import sys
 import hashlib
 import logging
 import uuid
+import time
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
 
 from tqdm import tqdm
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, OptimizersConfigDiff
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, 
+    OptimizersConfigDiff, HnswConfigDiff
+)
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
@@ -30,7 +34,7 @@ QDRANT_PORT = int(os.getenv('QDRANT_PORT', '6333'))
 QDRANT_API_KEY = os.getenv('QDRANT_API_KEY')
 OPENCV_REPO_PATH = os.getenv('OPENCV_REPO_PATH', '/app/opencv_repo')
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION_NAME', 'opencv_codebase')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'microsoft/graphcodebert-base')
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5')
 
 FILE_EXTENSIONS = {'.cpp', '.hpp', '.h', '.c', '.cc', '.cxx', '.py', '.cu', '.cuh'}
 SKIP_DIRS = {
@@ -120,7 +124,7 @@ def calculate_complexity(code: str) -> str:
         return 'high' if indicator_count > line_count * 0.2 else 'medium'
 
 
-def generate_uuid_from_string(s: str) -> str:
+def generate_point_id(s: str) -> str:
     return str(uuid.UUID(hashlib.md5(s.encode()).hexdigest()))
 
 
@@ -132,11 +136,11 @@ class ASTChunker:
     def _init_parsers(self):
         try:
             from tree_sitter import Language, Parser
-            import tree_sitter_cpp
-            import tree_sitter_python
+            import tree_sitter_cpp as tscpp
+            import tree_sitter_python as tspy
 
-            cpp_lang = Language(tree_sitter_cpp.language())
-            py_lang = Language(tree_sitter_python.language())
+            cpp_lang = Language(tscpp.language())
+            py_lang = Language(tspy.language())
 
             self._parsers['cpp'] = Parser(cpp_lang)
             self._parsers['python'] = Parser(py_lang)
@@ -205,7 +209,7 @@ class ASTChunker:
 
             processed_ranges.add((start, end))
 
-            chunk_id = generate_uuid_from_string(f"{file_path}:{start}:{end}")
+            chunk_id = generate_point_id(f"{file_path}:{start}:{end}")
 
             chunks.append(CodeChunk(
                 id=chunk_id,
@@ -289,7 +293,7 @@ class ASTChunker:
 
                 non_empty = sum(1 for l in chunk_lines if l.strip())
                 if non_empty >= MIN_CHUNK_LINES:
-                    chunk_id = generate_uuid_from_string(f"{file_path}:smart:{idx}")
+                    chunk_id = generate_point_id(f"{file_path}:smart:{idx}")
                     chunks.append(CodeChunk(
                         id=chunk_id,
                         code=code_text,
@@ -326,7 +330,7 @@ class ASTChunker:
             non_empty = sum(1 for l in chunk_lines if l.strip())
 
             if non_empty >= MIN_CHUNK_LINES:
-                chunk_id = generate_uuid_from_string(f"{file_path}:fixed:{chunk_num}")
+                chunk_id = generate_point_id(f"{file_path}:fixed:{chunk_num}")
                 chunks.append(CodeChunk(
                     id=chunk_id,
                     code=code_text,
@@ -351,7 +355,7 @@ class ASTChunker:
 class OpenCVIndexer:
     def __init__(self):
         logger.info("=" * 70)
-        logger.info("OpenCV Codebase Indexer v2.1")
+        logger.info("OpenCV Codebase Indexer v3.0 (Fixed)")
         logger.info("=" * 70)
 
         logger.info(f"Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
@@ -389,19 +393,37 @@ class OpenCVIndexer:
             if exists:
                 logger.info(f"Deleting existing collection: {COLLECTION_NAME}")
                 self.client.delete_collection(COLLECTION_NAME)
+                time.sleep(2)
 
             logger.info(f"Creating collection: {COLLECTION_NAME}")
+            
             self.client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(
                     size=self.embedding_dim,
-                    distance=Distance.COSINE
+                    distance=Distance.COSINE,
+                    on_disk=False
+                ),
+                hnsw_config=HnswConfigDiff(
+                    m=16,
+                    ef_construct=100,
+                    full_scan_threshold=10000,
+                    max_indexing_threads=0,
+                    on_disk=False
                 ),
                 optimizers_config=OptimizersConfigDiff(
-                    indexing_threshold=0
-                )
+                    indexing_threshold=0,
+                    memmap_threshold=0,
+                    max_optimization_threads=2
+                ),
+                on_disk_payload=False
             )
-            logger.info("Collection created with indexing_threshold=0")
+            
+            logger.info("Collection created with:")
+            logger.info("  - indexing_threshold=0 (build index immediately)")
+            logger.info("  - max_optimization_threads=2 (enable optimization)")
+            logger.info("  - on_disk=False (keep in RAM for speed)")
+            
         except Exception as e:
             logger.error(f"Failed to setup collection: {e}")
             raise
@@ -469,6 +491,79 @@ class OpenCVIndexer:
             normalize_embeddings=True,
             convert_to_numpy=True
         )
+
+    def _wait_for_indexing(self, timeout: int = 300) -> bool:
+        logger.info("Waiting for HNSW indexing to complete...")
+        start_time = time.time()
+        last_indexed = 0
+        stall_count = 0
+        
+        while time.time() - start_time < timeout:
+            try:
+                info = self.client.get_collection(COLLECTION_NAME)
+                indexed = info.indexed_vectors_count or 0
+                total = info.points_count or 0
+                status = info.status
+                
+                if indexed >= total and total > 0:
+                    logger.info(f"Indexing complete: {indexed}/{total} vectors indexed")
+                    return True
+                
+                if indexed == last_indexed:
+                    stall_count += 1
+                else:
+                    stall_count = 0
+                    last_indexed = indexed
+                
+                logger.info(f"Indexing progress: {indexed}/{total} (status: {status})")
+                
+                if stall_count >= 12:
+                    logger.warning("Indexing appears stalled, attempting to trigger optimization...")
+                    try:
+                        self.client.update_collection(
+                            collection_name=COLLECTION_NAME,
+                            optimizers_config=OptimizersConfigDiff(
+                                indexing_threshold=0,
+                                max_optimization_threads=4
+                            )
+                        )
+                        stall_count = 0
+                    except Exception as e:
+                        logger.warning(f"Failed to update collection: {e}")
+                
+                time.sleep(5)
+                
+            except Exception as e:
+                logger.error(f"Error checking indexing status: {e}")
+                time.sleep(5)
+        
+        logger.warning(f"Indexing timeout after {timeout}s")
+        return False
+
+    def _test_search(self) -> bool:
+        logger.info("Testing vector search...")
+        try:
+            test_vector = [0.1] * self.embedding_dim
+            
+            results = self.client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=test_vector,
+                limit=5,
+                with_payload=True
+            )
+            
+            if results:
+                logger.info(f"Search test PASSED: Retrieved {len(results)} results")
+                logger.info(f"  Top result score: {results[0].score:.4f}")
+                logger.info(f"  Top result file: {results[0].payload.get('file_path', 'unknown')}")
+                return True
+            else:
+                logger.error("Search test FAILED: No results returned")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Search test FAILED with error: {e}")
+            return False
 
     def index(self, repo_path: str):
         repo_path = Path(repo_path)
@@ -543,18 +638,10 @@ class OpenCVIndexer:
             except Exception as e:
                 logger.error(f"Upload error at batch {i // BATCH_SIZE}: {e}")
 
-        logger.info("Waiting for indexing to complete...")
-        import time
-        max_wait = 120
-        waited = 0
-        while waited < max_wait:
-            info = self.client.get_collection(COLLECTION_NAME)
-            if info.indexed_vectors_count >= info.points_count:
-                break
-            time.sleep(5)
-            waited += 5
-            logger.info(f"Indexing progress: {info.indexed_vectors_count}/{info.points_count}")
-
+        indexing_success = self._wait_for_indexing(timeout=300)
+        
+        search_success = self._test_search()
+        
         info = self.client.get_collection(COLLECTION_NAME)
 
         logger.info("=" * 70)
@@ -566,12 +653,18 @@ class OpenCVIndexer:
         logger.info(f"Total bytes: {self.stats['total_bytes']:,}")
         logger.info(f"Points in Qdrant: {info.points_count}")
         logger.info(f"Indexed vectors: {info.indexed_vectors_count}")
+        logger.info(f"Collection status: {info.status}")
+        logger.info(f"Optimizer status: {info.optimizer_status}")
         logger.info("=" * 70)
 
-        if info.indexed_vectors_count < info.points_count:
-            logger.warning("WARNING: Not all vectors indexed! Search may not work correctly.")
+        if not indexing_success:
+            logger.warning("WARNING: Indexing may not be complete!")
+        
+        if not search_success:
+            logger.error("CRITICAL: Search is not working!")
+            sys.exit(1)
         else:
-            logger.info("SUCCESS: All vectors indexed and searchable!")
+            logger.info("SUCCESS: All vectors indexed and search is working!")
 
 
 def main():

@@ -91,7 +91,7 @@ class RAGConfig:
     max_context_tokens: int = 12000
     max_context_chars: int = 48000
     enabled_commands: List[str] = field(default_factory=list)
-    embedding_model: str = "microsoft/graphcodebert-base"
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
     cache_dir: str = "/app/cache/embeddings"
     
     def __post_init__(self):
@@ -103,7 +103,7 @@ class RAGConfig:
         commands_str = os.getenv("RAG_ENABLED_COMMANDS", "review,improve,ask")
         self.enabled_commands = [cmd.strip().lower() for cmd in commands_str.split(",") if cmd.strip()]
         
-        self.embedding_model = os.getenv("EMBEDDING_MODEL", "microsoft/graphcodebert-base")
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
         self.cache_dir = os.getenv("EMBEDDING_CACHE_DIR", "/app/cache/embeddings")
     
     def is_rag_enabled_for(self, command: str) -> bool:

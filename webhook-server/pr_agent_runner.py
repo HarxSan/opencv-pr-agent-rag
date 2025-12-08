@@ -3,7 +3,7 @@ import subprocess
 import os
 import shutil
 import tempfile
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from pathlib import Path
 import re
 
@@ -11,7 +11,6 @@ from config import Config
 from rag_retriever import RAGRetriever
 
 logger = logging.getLogger(__name__)
-
 
 VALID_COMMANDS = {
     'review', 'improve', 'ask', 'describe',
@@ -86,6 +85,11 @@ If the context doesn't contain relevant information, say so clearly."""
         
         escaped_instructions = extra_instructions.replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
         
+        model_name = self.config.model.model_name
+        api_base = self.config.model.api_base.rstrip('/')
+        if not api_base.endswith('/v1'):
+            api_base = f"{api_base}/v1"
+        
         config_toml = f'''[config]
 git_provider = "github"
 publish_output = true
@@ -95,8 +99,8 @@ use_repo_settings_file = false
 use_wiki_settings_file = false
 use_global_settings_file = false
 
-model = "openai/{self.config.model.model_name}"
-fallback_models = ["openai/{self.config.model.model_name}"]
+model = "openai/{model_name}"
+fallback_models = ["openai/{model_name}"]
 custom_model_max_tokens = {self.config.model.max_tokens}
 max_model_tokens = {self.config.model.max_tokens}
 duplicate_examples = true
@@ -165,7 +169,7 @@ auto_improve = false
         
         secrets_toml = f'''[openai]
 key = "{self.config.model.api_key}"
-api_base = "{self.config.model.api_base}"
+api_base = "{api_base}"
 
 [github]
 user_token = "{self.config.github.user_token or ''}"
@@ -186,15 +190,22 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
         os.chmod(secrets_path, 0o600)
         
         self._config_dir = config_dir
-        logger.debug(f"PR-Agent config created at {config_dir}")
+        logger.info(f"PR-Agent config: model={model_name}, api_base={api_base}")
+        logger.debug(f"Config directory: {config_dir}")
         
         return config_dir
     
     def _build_environment(self, config_dir: Path) -> Dict[str, str]:
         env = os.environ.copy()
         
+        api_base = self.config.model.api_base.rstrip('/')
+        if not api_base.endswith('/v1'):
+            api_base = f"{api_base}/v1"
+        
+        env['OPENAI_API_KEY'] = self.config.model.api_key
+        env['OPENAI_API_BASE'] = api_base
         env['OPENAI__KEY'] = self.config.model.api_key
-        env['OPENAI__API_BASE'] = self.config.model.api_base
+        env['OPENAI__API_BASE'] = api_base
         
         env['CONFIG__GIT_PROVIDER'] = 'github'
         env['CONFIG__MODEL'] = f'openai/{self.config.model.model_name}'
@@ -292,8 +303,8 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
             cli_args.append(args)
         
         logger.info(f"Executing: pr_agent.cli {command}")
-        logger.debug(f"Model: {self.config.model.model_name}")
-        logger.debug(f"API Base: {self.config.model.api_base}")
+        logger.info(f"Model: openai/{self.config.model.model_name}")
+        logger.info(f"API Base: {env.get('OPENAI_API_BASE')}")
         
         try:
             result = subprocess.run(
@@ -307,11 +318,31 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
             
             success = result.returncode == 0
             
+            if result.stdout:
+                for line in result.stdout.strip().split('\n')[-20:]:
+                    logger.info(f"[PR-Agent stdout] {line}")
+            
+            if result.stderr:
+                stderr_lines = result.stderr.strip().split('\n')
+                for line in stderr_lines[-30:]:
+                    if 'error' in line.lower() or 'exception' in line.lower() or 'traceback' in line.lower():
+                        logger.error(f"[PR-Agent stderr] {line}")
+                    elif 'warning' in line.lower():
+                        logger.warning(f"[PR-Agent stderr] {line}")
+                    else:
+                        logger.debug(f"[PR-Agent stderr] {line}")
+            
             if not success:
                 logger.error(f"PR-Agent failed with return code {result.returncode}")
-                logger.error(f"stderr: {result.stderr[:1000] if result.stderr else 'empty'}")
+                if result.stderr:
+                    error_snippet = result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr
+                    logger.error(f"Last stderr: {error_snippet}")
             else:
-                logger.info(f"PR-Agent completed successfully")
+                if 'error' in (result.stderr or '').lower() or 'exception' in (result.stderr or '').lower():
+                    logger.warning("PR-Agent returned 0 but stderr contains errors - may have partially failed")
+                    success = False
+                else:
+                    logger.info(f"PR-Agent completed successfully")
             
             return {
                 'success': success,
@@ -333,7 +364,7 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
                 'error': f'Command timed out after {self.config.server.request_timeout}s'
             }
         except Exception as e:
-            logger.error(f"Error executing PR-Agent: {e}")
+            logger.exception(f"Error executing PR-Agent: {e}")
             return {
                 'success': False,
                 'command': command,
