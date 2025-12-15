@@ -53,7 +53,7 @@ class ModelConfig:
             "LIGHTNING_AI_ENDPOINT",
             "https://3000-01kbs5g1xhxxrzv5rh00t479a4.cloudspaces.litng.ai"
         ).rstrip("/")
-        self.model_name = os.getenv("LIGHTNING_AI_MODEL_NAME", "qwen2.5-coder-7b-instruct")
+        self.model_name = os.getenv("LIGHTNING_AI_MODEL_NAME", "nareshmlx/code-reviewer-opencv-harxsan-v2")
         self.max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "32000"))
         self.temperature = float(os.getenv("MODEL_TEMPERATURE", "0.3"))
         self.api_key = os.getenv("LIGHTNING_AI_API_KEY", "not-used")

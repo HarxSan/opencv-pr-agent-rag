@@ -17,6 +17,6 @@ RUN mkdir -p /app/logs /app/cache/embeddings
 
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/app/cache/huggingface
-ENV TRANSFORMERS_CACHE=/app/cache/huggingface
+ENV HF_HOME=/app/cache/huggingface
 
 CMD ["python", "-u", "indexer.py"]

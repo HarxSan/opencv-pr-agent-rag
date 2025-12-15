@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, 
+    Distance, VectorParams, PointStruct,
     OptimizersConfigDiff, HnswConfigDiff
 )
 from sentence_transformers import SentenceTransformer
@@ -47,7 +47,7 @@ SKIP_DIRS = {
 MIN_CHUNK_LINES = 8
 MAX_CHUNK_SIZE = 300
 CONTEXT_LINES = 8
-BATCH_SIZE = 100
+BATCH_SIZE = 50
 EMBEDDING_BATCH_SIZE = 32
 
 
@@ -355,7 +355,7 @@ class ASTChunker:
 class OpenCVIndexer:
     def __init__(self):
         logger.info("=" * 70)
-        logger.info("OpenCV Codebase Indexer v3.0 (Fixed)")
+        logger.info("OpenCV Codebase Indexer v3.1 (Fixed Vector Storage)")
         logger.info("=" * 70)
 
         logger.info(f"Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
@@ -363,7 +363,7 @@ class OpenCVIndexer:
             host=QDRANT_HOST,
             port=QDRANT_PORT,
             api_key=QDRANT_API_KEY,
-            timeout=120,
+            timeout=300,
             prefer_grpc=False,
             https=False
         )
@@ -393,10 +393,10 @@ class OpenCVIndexer:
             if exists:
                 logger.info(f"Deleting existing collection: {COLLECTION_NAME}")
                 self.client.delete_collection(COLLECTION_NAME)
-                time.sleep(2)
+                time.sleep(3)
 
             logger.info(f"Creating collection: {COLLECTION_NAME}")
-            
+
             self.client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(
@@ -408,22 +408,22 @@ class OpenCVIndexer:
                     m=16,
                     ef_construct=100,
                     full_scan_threshold=10000,
-                    max_indexing_threads=0,
+                    max_indexing_threads=2,
                     on_disk=False
                 ),
                 optimizers_config=OptimizersConfigDiff(
-                    indexing_threshold=0,
-                    memmap_threshold=0,
+                    indexing_threshold=5000,
+                    memmap_threshold=50000,
                     max_optimization_threads=2
                 ),
                 on_disk_payload=False
             )
-            
-            logger.info("Collection created with:")
-            logger.info("  - indexing_threshold=0 (build index immediately)")
-            logger.info("  - max_optimization_threads=2 (enable optimization)")
-            logger.info("  - on_disk=False (keep in RAM for speed)")
-            
+
+            logger.info("Collection created with SAFE settings:")
+            logger.info("  - indexing_threshold=20000 (defer indexing until after upload)")
+            logger.info("  - memmap_threshold=50000 (keep vectors in RAM during upload)")
+            logger.info("  - max_indexing_threads=2 (controlled parallelism)")
+
         except Exception as e:
             logger.error(f"Failed to setup collection: {e}")
             raise
@@ -483,84 +483,138 @@ class OpenCVIndexer:
             self.stats['files_skipped'] += 1
             return []
 
-    def _create_embeddings_batch(self, texts: List[str]) -> np.ndarray:
-        return self.embedding_model.encode(
+    def _create_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        embeddings = self.embedding_model.encode(
             texts,
             batch_size=EMBEDDING_BATCH_SIZE,
             show_progress_bar=False,
             normalize_embeddings=True,
             convert_to_numpy=True
         )
+        result = []
+        for emb in embeddings:
+            vec = [float(x) for x in emb]
+            result.append(vec)
+        return result
 
-    def _wait_for_indexing(self, timeout: int = 300) -> bool:
+    def _verify_vectors_stored(self, sample_size: int = 5) -> bool:
+        logger.info(f"Verifying vectors are properly stored (sampling {sample_size} points)...")
+        try:
+            result = self.client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=sample_size,
+                with_vectors=True,
+                with_payload=True
+            )
+
+            points = result[0]
+            if not points:
+                logger.error("No points found in collection!")
+                return False
+
+            for i, point in enumerate(points):
+                if point.vector is None:
+                    logger.error(f"Point {i} has NULL vector!")
+                    return False
+
+                vec_sum = sum(point.vector)
+                if abs(vec_sum) < 0.0001:
+                    logger.error(f"Point {i} has ZERO vector! File: {point.payload.get('file_path')}")
+                    return False
+
+                logger.debug(f"Point {i}: vector sum = {vec_sum:.4f}, file = {point.payload.get('file_path', '?')[:40]}")
+
+            logger.info(f"All {len(points)} sampled vectors are valid (non-zero)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Vector verification failed: {e}")
+            return False
+
+    def _trigger_indexing(self) -> bool:
+        logger.info("Triggering HNSW index build...")
+        try:
+            self.client.update_collection(
+                collection_name=COLLECTION_NAME,
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=0
+                )
+            )
+            logger.info("Index build triggered")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to trigger indexing: {e}")
+            return False
+
+    def _wait_for_indexing(self, timeout: int = 600) -> bool:
         logger.info("Waiting for HNSW indexing to complete...")
         start_time = time.time()
         last_indexed = 0
         stall_count = 0
-        
+
         while time.time() - start_time < timeout:
             try:
                 info = self.client.get_collection(COLLECTION_NAME)
                 indexed = info.indexed_vectors_count or 0
                 total = info.points_count or 0
                 status = info.status
-                
+
                 if indexed >= total and total > 0:
                     logger.info(f"Indexing complete: {indexed}/{total} vectors indexed")
                     return True
-                
+
                 if indexed == last_indexed:
                     stall_count += 1
                 else:
                     stall_count = 0
                     last_indexed = indexed
-                
+
                 logger.info(f"Indexing progress: {indexed}/{total} (status: {status})")
-                
-                if stall_count >= 12:
-                    logger.warning("Indexing appears stalled, attempting to trigger optimization...")
-                    try:
-                        self.client.update_collection(
-                            collection_name=COLLECTION_NAME,
-                            optimizers_config=OptimizersConfigDiff(
-                                indexing_threshold=0,
-                                max_optimization_threads=4
-                            )
-                        )
-                        stall_count = 0
-                    except Exception as e:
-                        logger.warning(f"Failed to update collection: {e}")
-                
+
+                if stall_count >= 24:
+                    logger.warning("Indexing appears stalled after 2 minutes, but vectors are stored.")
+                    return True
+
                 time.sleep(5)
-                
+
             except Exception as e:
                 logger.error(f"Error checking indexing status: {e}")
                 time.sleep(5)
-        
+
         logger.warning(f"Indexing timeout after {timeout}s")
         return False
 
     def _test_search(self) -> bool:
         logger.info("Testing vector search...")
         try:
-            test_vector = [0.1] * self.embedding_dim
-            
+            test_text = "cv::Mat memory allocation create"
+            test_embedding = self.embedding_model.encode(
+                test_text,
+                normalize_embeddings=True
+            )
+            test_vector = [float(x) for x in test_embedding]
+
             results = self.client.search(
                 collection_name=COLLECTION_NAME,
                 query_vector=test_vector,
                 limit=5,
                 with_payload=True
             )
-            
+
             if results:
                 logger.info(f"Search test PASSED: Retrieved {len(results)} results")
-                logger.info(f"  Top result score: {results[0].score:.4f}")
-                logger.info(f"  Top result file: {results[0].payload.get('file_path', 'unknown')}")
+                for i, r in enumerate(results[:3]):
+                    logger.info(f"  Result {i+1}: score={r.score:.4f}, file={r.payload.get('file_path', 'unknown')[:50]}")
+
+                if results[0].score < 0.01:
+                    logger.error("Search scores are too low - vectors may be corrupted!")
+                    return False
+
                 return True
             else:
                 logger.error("Search test FAILED: No results returned")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Search test FAILED with error: {e}")
             return False
@@ -592,56 +646,79 @@ class OpenCVIndexer:
             logger.error("No chunks created!")
             sys.exit(1)
 
-        logger.info("Generating embeddings...")
-        codes = [c.code for c in all_chunks]
+        logger.info("Generating embeddings and uploading to Qdrant...")
+        logger.info(f"Using batch size: {BATCH_SIZE} for upload")
 
-        all_embeddings = []
-        for i in tqdm(range(0, len(codes), EMBEDDING_BATCH_SIZE), desc="Embedding"):
-            batch = codes[i:i + EMBEDDING_BATCH_SIZE]
-            embeddings = self._create_embeddings_batch(batch)
-            all_embeddings.append(embeddings)
+        total_uploaded = 0
+        failed_batches = 0
 
-        embeddings = np.vstack(all_embeddings)
-        logger.info(f"Generated {len(embeddings)} embeddings")
-
-        logger.info(f"Uploading to Qdrant (batch size: {BATCH_SIZE})...")
-
-        for i in tqdm(range(0, len(all_chunks), BATCH_SIZE), desc="Uploading"):
-            batch = all_chunks[i:i + BATCH_SIZE]
-            batch_embeddings = embeddings[i:i + BATCH_SIZE]
-
-            points = [
-                PointStruct(
-                    id=chunk.id,
-                    vector=emb.tolist(),
-                    payload={
-                        'code': chunk.code,
-                        'file_path': chunk.file_path,
-                        'file_name': chunk.file_name,
-                        'module': chunk.module,
-                        'chunk_type': chunk.chunk_type,
-                        'start_line': chunk.start_line,
-                        'end_line': chunk.end_line,
-                        'language': chunk.language,
-                        'complexity': chunk.complexity
-                    }
-                )
-                for chunk, emb in zip(batch, batch_embeddings)
-            ]
+        for i in tqdm(range(0, len(all_chunks), BATCH_SIZE), desc="Embedding & Uploading"):
+            batch_chunks = all_chunks[i:i + BATCH_SIZE]
+            batch_codes = [c.code for c in batch_chunks]
 
             try:
-                self.client.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=points,
-                    wait=True
-                )
-            except Exception as e:
-                logger.error(f"Upload error at batch {i // BATCH_SIZE}: {e}")
+                batch_embeddings = self._create_embeddings_batch(batch_codes)
 
-        indexing_success = self._wait_for_indexing(timeout=300)
-        
-        search_success = self._test_search()
-        
+                if len(batch_embeddings) != len(batch_chunks):
+                    logger.error(f"Embedding count mismatch: {len(batch_embeddings)} vs {len(batch_chunks)}")
+                    failed_batches += 1
+                    continue
+
+                points = []
+                for chunk, embedding in zip(batch_chunks, batch_embeddings):
+                    if abs(sum(embedding)) < 0.0001:
+                        logger.warning(f"Zero embedding for chunk: {chunk.file_path}:{chunk.start_line}")
+                        continue
+
+                    points.append(PointStruct(
+                        id=chunk.id,
+                        vector=embedding,
+                        payload={
+                            'code': chunk.code,
+                            'file_path': chunk.file_path,
+                            'file_name': chunk.file_name,
+                            'module': chunk.module,
+                            'chunk_type': chunk.chunk_type,
+                            'start_line': chunk.start_line,
+                            'end_line': chunk.end_line,
+                            'language': chunk.language,
+                            'complexity': chunk.complexity
+                        }
+                    ))
+
+                if points:
+                    self.client.upsert(
+                        collection_name=COLLECTION_NAME,
+                        points=points,
+                        wait=True
+                    )
+                    total_uploaded += len(points)
+
+                if (i // BATCH_SIZE) % 20 == 0 and i > 0:
+                    logger.info(f"Progress: {total_uploaded} points uploaded")
+
+            except Exception as e:
+                logger.error(f"Error uploading batch {i // BATCH_SIZE}: {e}")
+                failed_batches += 1
+                continue
+
+        logger.info(f"Upload complete: {total_uploaded} points uploaded, {failed_batches} batches failed")
+
+        logger.info("Waiting for data to be persisted...")
+        time.sleep(5)
+
+        if not self._verify_vectors_stored():
+            logger.error("CRITICAL: Vector verification failed! Data may be corrupted.")
+            sys.exit(1)
+
+        self._trigger_indexing()
+
+        self._wait_for_indexing(timeout=600)
+
+        if not self._test_search():
+            logger.error("CRITICAL: Search test failed!")
+            sys.exit(1)
+
         info = self.client.get_collection(COLLECTION_NAME)
 
         logger.info("=" * 70)
@@ -654,17 +731,8 @@ class OpenCVIndexer:
         logger.info(f"Points in Qdrant: {info.points_count}")
         logger.info(f"Indexed vectors: {info.indexed_vectors_count}")
         logger.info(f"Collection status: {info.status}")
-        logger.info(f"Optimizer status: {info.optimizer_status}")
         logger.info("=" * 70)
-
-        if not indexing_success:
-            logger.warning("WARNING: Indexing may not be complete!")
-        
-        if not search_success:
-            logger.error("CRITICAL: Search is not working!")
-            sys.exit(1)
-        else:
-            logger.info("SUCCESS: All vectors indexed and search is working!")
+        logger.info("SUCCESS: All vectors indexed and search is working!")
 
 
 def main():

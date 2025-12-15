@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN pip install --no-cache-dir "pr-agent @ git+https://github.com/qodo-ai/pr-agent.git@main"
 
-ENV TRANSFORMERS_CACHE=/app/cache/transformers
+ENV HF_HOME=/app/cache/transformers
 ENV HF_HOME=/app/cache/huggingface
 RUN mkdir -p /app/cache/transformers /app/cache/huggingface /app/logs
 
