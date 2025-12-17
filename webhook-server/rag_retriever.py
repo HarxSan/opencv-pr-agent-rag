@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 import hashlib
 import re
+import time
 from collections import OrderedDict
 
 from qdrant_client import QdrantClient
@@ -60,6 +61,7 @@ class RAGRetriever:
         self._client: Optional[QdrantClient] = None
         self._embedding_model: Optional[SentenceTransformer] = None
         self._cache = LRUCache(max_size=500)
+        self._collection_verified = False  # Track if collection has been verified
         
         self._opencv_keywords = {
             'mat', 'umat', 'inputarray', 'outputarray', 'scalar',
@@ -84,8 +86,64 @@ class RAGRetriever:
                 prefer_grpc=False,
                 https=False
             )
-            self._verify_collection()
+            # Don't verify on initialization - do it lazily on first retrieval
         return self._client
+    
+    def _verify_collection_with_retry(self, max_retries: int = 3, retry_delay: int = 2) -> bool:
+        """
+        Verify collection exists and is ready, with retry logic.
+        This handles the case where Qdrant is starting up and collection is still loading.
+        """
+        if self._collection_verified:
+            return True
+            
+        for attempt in range(max_retries):
+            try:
+                collections = self.client.get_collections().collections
+                collection_exists = any(c.name == self.qdrant_config.collection_name for c in collections)
+                
+                if not collection_exists:
+                    logger.warning(
+                        f"Collection '{self.qdrant_config.collection_name}' not found "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    return False
+                
+                # Collection exists, check if it has points
+                info = self.client.get_collection(self.qdrant_config.collection_name)
+                points_count = info.points_count or 0
+                
+                if points_count == 0:
+                    logger.warning(
+                        f"Collection '{self.qdrant_config.collection_name}' exists but has 0 points "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    return False
+                
+                logger.info(
+                    f"Connected to collection '{self.qdrant_config.collection_name}' "
+                    f"with {points_count} indexed chunks"
+                )
+                self._collection_verified = True
+                return True
+                
+            except Exception as e:
+                logger.warning(
+                    f"Failed to verify Qdrant collection (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to verify collection after {max_retries} attempts")
+                    return False
+        
+        return False
     
     @property
     def embedding_model(self) -> SentenceTransformer:
@@ -97,20 +155,6 @@ class RAGRetriever:
             )
             logger.info("Embedding model loaded successfully")
         return self._embedding_model
-    
-    def _verify_collection(self):
-        try:
-            collections = self.client.get_collections().collections
-            if not any(c.name == self.qdrant_config.collection_name for c in collections):
-                raise RuntimeError(
-                    f"Collection '{self.qdrant_config.collection_name}' not found. "
-                    "Please run the indexer first."
-                )
-            info = self.client.get_collection(self.qdrant_config.collection_name)
-            logger.info(f"Connected to collection with {info.points_count} indexed chunks")
-        except Exception as e:
-            logger.error(f"Failed to verify Qdrant collection: {e}")
-            raise
     
     def _generate_cache_key(self, queries: List[str], module: Optional[str]) -> str:
         content = f"{','.join(sorted(queries))}:{module or 'all'}"
@@ -275,6 +319,14 @@ class RAGRetriever:
     
     def retrieve(self, pr_title: str, pr_description: str,
                  changed_files: List[str], diff: str) -> List[CodeChunk]:
+        """
+        Retrieve relevant code chunks with proper error handling for Qdrant unavailability.
+        """
+        # Verify collection is ready (with retry logic)
+        if not self._verify_collection_with_retry():
+            logger.error("RAG retrieval skipped: Qdrant collection not available")
+            return []
+        
         queries = self._extract_search_queries(pr_title, pr_description, changed_files, diff)
         if not queries:
             logger.warning("No search queries generated from PR context")
@@ -440,7 +492,11 @@ class RAGRetriever:
         return result
     
     def health_check(self) -> Tuple[bool, str]:
+        """Health check with retry logic for startup scenarios"""
         try:
+            if not self._verify_collection_with_retry(max_retries=1, retry_delay=1):
+                return False, "Collection not available or empty"
+            
             info = self.client.get_collection(self.qdrant_config.collection_name)
             return True, f"Qdrant OK: {info.points_count} points indexed"
         except Exception as e:

@@ -26,6 +26,14 @@ services:
       context: ./indexer
       dockerfile: Dockerfile
     container_name: opencv-indexer
+    deploy:
+      resources:
+        limits:
+          cpus: '12'
+          memory: 8G
+        reservations:
+          cpus: '8'
+          memory: 4G
     volumes:
       - ${OPENCV_REPO_PATH:?OPENCV_REPO_PATH is required}:/app/opencv_repo:ro
       - ./data/logs:/app/logs
@@ -37,9 +45,13 @@ services:
       - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-opencv_codebase}
       - OPENCV_REPO_PATH=/app/opencv_repo
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-128}
+      - UPLOAD_BATCH_SIZE=${UPLOAD_BATCH_SIZE:-500}
+      - PARALLEL_WORKERS=${PARALLEL_WORKERS:-12}
+      - INDEXING_THRESHOLD=${INDEXING_THRESHOLD:-10000}
+      - MAX_INDEXING_THREADS=${MAX_INDEXING_THREADS:-4}
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
     networks:
       - opencv-network
     profiles:
@@ -56,6 +68,7 @@ services:
       - ./data/logs:/app/logs
       - ./data/cache:/app/cache
       - ./secrets:/app/secrets:ro
+      - ./.env:/app/.env:ro
     environment:
       - GITHUB_APP_ID=${GITHUB_APP_ID:-}
       - GITHUB_APP_PRIVATE_KEY_PATH=/app/secrets/github-app-private-key.pem
@@ -83,8 +96,7 @@ services:
       - MAX_FILES_PER_PR=${MAX_FILES_PER_PR:-500}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-600}
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
     networks:
       - opencv-network
     restart: unless-stopped

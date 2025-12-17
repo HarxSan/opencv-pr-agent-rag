@@ -15,7 +15,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import load_config, Config
+from config import load_config, Config, ModelConfig
 from rag_retriever import RAGRetriever
 from pr_agent_runner import PRAgentRunner
 
@@ -31,6 +31,27 @@ app = Flask(__name__)
 config: Optional[Config] = None
 rag_retriever: Optional[RAGRetriever] = None
 pr_agent_runner: Optional[PRAgentRunner] = None
+
+
+def reload_model_config():
+    import os
+    from config import ModelConfig
+    
+    new_model_config = ModelConfig()
+    
+    global config
+    if config:
+        old_endpoint = config.model.endpoint
+        old_model = config.model.model_name
+        
+        config.model = new_model_config
+        
+        if old_endpoint != new_model_config.endpoint or old_model != new_model_config.model_name:
+            logger.info(
+                f"Model config reloaded: "
+                f"{old_model} -> {new_model_config.model_name}, "
+                f"{old_endpoint} -> {new_model_config.endpoint}"
+            )
 
 
 class GitHubClient:
@@ -250,6 +271,8 @@ def process_webhook_async(event_type: str, payload: Dict[str, Any]):
             
             logger.info(f"Processing command on {pr_url}: {comment_body[:50]}...")
             
+            reload_model_config()
+            
             gh_client = GitHubClient(config)
             
             gh_client.add_reaction(owner, repo_name, comment_id, 'eyes')
@@ -386,6 +409,8 @@ def test_endpoint():
         owner = parts[-4]
         repo = parts[-3]
         pr_number = int(parts[-1])
+        
+        reload_model_config()
         
         gh_client = GitHubClient(config)
         pr_context = extract_pr_context(gh_client, owner, repo, pr_number)

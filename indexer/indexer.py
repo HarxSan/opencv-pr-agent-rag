@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from tqdm import tqdm
 from qdrant_client import QdrantClient
@@ -35,6 +36,11 @@ QDRANT_API_KEY = os.getenv('QDRANT_API_KEY')
 OPENCV_REPO_PATH = os.getenv('OPENCV_REPO_PATH', '/app/opencv_repo')
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION_NAME', 'opencv_codebase')
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5')
+EMBEDDING_BATCH_SIZE = int(os.getenv('EMBEDDING_BATCH_SIZE', '128'))
+UPLOAD_BATCH_SIZE = int(os.getenv('UPLOAD_BATCH_SIZE', '500'))
+PARALLEL_WORKERS = int(os.getenv('PARALLEL_WORKERS', '12'))
+INDEXING_THRESHOLD = int(os.getenv('INDEXING_THRESHOLD', '10000'))
+MAX_INDEXING_THREADS = int(os.getenv('MAX_INDEXING_THREADS', '4'))
 
 FILE_EXTENSIONS = {'.cpp', '.hpp', '.h', '.c', '.cc', '.cxx', '.py', '.cu', '.cuh'}
 SKIP_DIRS = {
@@ -47,8 +53,6 @@ SKIP_DIRS = {
 MIN_CHUNK_LINES = 8
 MAX_CHUNK_SIZE = 300
 CONTEXT_LINES = 8
-BATCH_SIZE = 50
-EMBEDDING_BATCH_SIZE = 32
 
 
 @dataclass
@@ -352,10 +356,45 @@ class ASTChunker:
         return chunks
 
 
+def process_file_worker(args: Tuple[Path, Path]) -> List[CodeChunk]:
+    file_path, repo_root = args
+    try:
+        stat = file_path.stat()
+        if stat.st_size > 1024 * 1024:
+            return []
+
+        content = file_path.read_text(encoding='utf-8', errors='ignore')
+
+        if not content.strip() or len(content) < 100:
+            return []
+
+        language = detect_language(file_path)
+
+        try:
+            rel_path = str(file_path.relative_to(repo_root))
+        except ValueError:
+            rel_path = str(file_path)
+
+        module = extract_module(rel_path, str(repo_root))
+
+        chunker = ASTChunker()
+        chunks = chunker.chunk(content, language, rel_path)
+
+        for chunk in chunks:
+            chunk.module = module
+            chunk.complexity = calculate_complexity(chunk.code)
+
+        return chunks
+
+    except Exception as e:
+        logger.error(f"Error processing {file_path}: {e}")
+        return []
+
+
 class OpenCVIndexer:
     def __init__(self):
         logger.info("=" * 70)
-        logger.info("OpenCV Codebase Indexer v3.1 (Fixed Vector Storage)")
+        logger.info("OpenCV Codebase Indexer v4.0 (Optimized)")
         logger.info("=" * 70)
 
         logger.info(f"Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
@@ -371,12 +410,19 @@ class OpenCVIndexer:
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
         self.embedding_model = SentenceTransformer(
             EMBEDDING_MODEL,
-            cache_folder='/app/cache/embeddings'
+            cache_folder='/app/cache/embeddings',
+            device='cpu'
         )
+        self.embedding_model.max_seq_length = 512
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
         logger.info(f"Embedding dimension: {self.embedding_dim}")
 
-        self.chunker = ASTChunker()
+        logger.info(f"Configuration:")
+        logger.info(f"  - Embedding batch size: {EMBEDDING_BATCH_SIZE}")
+        logger.info(f"  - Upload batch size: {UPLOAD_BATCH_SIZE}")
+        logger.info(f"  - Parallel workers: {PARALLEL_WORKERS}")
+        logger.info(f"  - Indexing threshold: {INDEXING_THRESHOLD}")
+        logger.info(f"  - Max indexing threads: {MAX_INDEXING_THREADS}")
 
         self.stats = {
             'files_processed': 0,
@@ -402,27 +448,29 @@ class OpenCVIndexer:
                 vectors_config=VectorParams(
                     size=self.embedding_dim,
                     distance=Distance.COSINE,
-                    on_disk=False
+                    on_disk=True
                 ),
                 hnsw_config=HnswConfigDiff(
                     m=16,
                     ef_construct=100,
                     full_scan_threshold=10000,
-                    max_indexing_threads=2,
-                    on_disk=False
+                    max_indexing_threads=MAX_INDEXING_THREADS,
+                    on_disk=True
                 ),
                 optimizers_config=OptimizersConfigDiff(
-                    indexing_threshold=5000,
+                    indexing_threshold=INDEXING_THRESHOLD,
                     memmap_threshold=50000,
                     max_optimization_threads=2
                 ),
-                on_disk_payload=False
+                on_disk_payload=True
             )
 
-            logger.info("Collection created with SAFE settings:")
-            logger.info("  - indexing_threshold=20000 (defer indexing until after upload)")
-            logger.info("  - memmap_threshold=50000 (keep vectors in RAM during upload)")
-            logger.info("  - max_indexing_threads=2 (controlled parallelism)")
+            logger.info("Collection created with optimized settings:")
+            logger.info(f"  - indexing_threshold={INDEXING_THRESHOLD} (deferred indexing)")
+            logger.info("  - memmap_threshold=50000 (keep vectors in RAM during indexing)")
+            logger.info(f"  - max_indexing_threads={MAX_INDEXING_THREADS}")
+            logger.info("  - on_disk=True (HNSW and vectors persist to disk)")
+            logger.info("  - on_disk_payload=True (payloads persist to disk)")
 
         except Exception as e:
             logger.error(f"Failed to setup collection: {e}")
@@ -443,59 +491,31 @@ class OpenCVIndexer:
         logger.info(f"Found {len(files)} source files")
         return files
 
-    def _process_file(self, file_path: Path, repo_root: Path) -> List[CodeChunk]:
-        try:
-            stat = file_path.stat()
-            if stat.st_size > 1024 * 1024:
-                logger.debug(f"Skipping large file: {file_path} ({stat.st_size} bytes)")
-                self.stats['files_skipped'] += 1
-                return []
+    def _process_files_parallel(self, files: List[Path], repo_root: Path) -> List[CodeChunk]:
+        logger.info(f"Processing {len(files)} files with {PARALLEL_WORKERS} workers...")
+        all_chunks: List[CodeChunk] = []
+        
+        file_args = [(f, repo_root) for f in files]
+        
+        with ProcessPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+            futures = {executor.submit(process_file_worker, args): args[0] for args in file_args}
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Parsing files"):
+                file_path = futures[future]
+                try:
+                    chunks = future.result()
+                    if chunks:
+                        all_chunks.extend(chunks)
+                        self.stats['files_processed'] += 1
+                        self.stats['chunks_created'] += len(chunks)
+                    else:
+                        self.stats['files_skipped'] += 1
+                except Exception as e:
+                    logger.error(f"Failed to process {file_path}: {e}")
+                    self.stats['files_skipped'] += 1
 
-            content = file_path.read_text(encoding='utf-8', errors='ignore')
-
-            if not content.strip() or len(content) < 100:
-                self.stats['files_skipped'] += 1
-                return []
-
-            language = detect_language(file_path)
-
-            try:
-                rel_path = str(file_path.relative_to(repo_root))
-            except ValueError:
-                rel_path = str(file_path)
-
-            module = extract_module(rel_path, str(repo_root))
-
-            chunks = self.chunker.chunk(content, language, rel_path)
-
-            for chunk in chunks:
-                chunk.module = module
-                chunk.complexity = calculate_complexity(chunk.code)
-
-            self.stats['files_processed'] += 1
-            self.stats['chunks_created'] += len(chunks)
-            self.stats['total_bytes'] += len(content)
-
-            return chunks
-
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-            self.stats['files_skipped'] += 1
-            return []
-
-    def _create_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        embeddings = self.embedding_model.encode(
-            texts,
-            batch_size=EMBEDDING_BATCH_SIZE,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
-        result = []
-        for emb in embeddings:
-            vec = [float(x) for x in emb]
-            result.append(vec)
-        return result
+        logger.info(f"Created {len(all_chunks)} chunks from {self.stats['files_processed']} files")
+        return all_chunks
 
     def _verify_vectors_stored(self, sample_size: int = 5) -> bool:
         logger.info(f"Verifying vectors are properly stored (sampling {sample_size} points)...")
@@ -633,32 +653,46 @@ class OpenCVIndexer:
             logger.error("No source files found!")
             sys.exit(1)
 
-        logger.info("Processing files...")
-        all_chunks: List[CodeChunk] = []
-
-        for file_path in tqdm(files, desc="Parsing files"):
-            chunks = self._process_file(file_path, repo_path)
-            all_chunks.extend(chunks)
-
-        logger.info(f"Created {len(all_chunks)} chunks from {self.stats['files_processed']} files")
+        all_chunks = self._process_files_parallel(files, repo_path)
 
         if not all_chunks:
             logger.error("No chunks created!")
             sys.exit(1)
 
-        logger.info("Generating embeddings and uploading to Qdrant...")
-        logger.info(f"Using batch size: {BATCH_SIZE} for upload")
-
+        logger.info("Generating embeddings for all chunks...")
+        logger.info(f"Using embedding batch size: {EMBEDDING_BATCH_SIZE}")
+        
+        all_codes = [c.code for c in all_chunks]
+        logger.info(f"Encoding {len(all_codes)} chunks in batches...")
+        
+        all_embeddings = self.embedding_model.encode(
+            all_codes,
+            batch_size=EMBEDDING_BATCH_SIZE,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            convert_to_tensor=False,
+            device='cpu'
+        )
+        
+        logger.info(f"Embeddings generated: {len(all_embeddings)} vectors")
+        
+        embeddings_list = []
+        for emb in all_embeddings:
+            vec = [float(x) for x in emb]
+            embeddings_list.append(vec)
+        
+        logger.info("Uploading to Qdrant...")
+        logger.info(f"Using upload batch size: {UPLOAD_BATCH_SIZE}")
+        
         total_uploaded = 0
         failed_batches = 0
 
-        for i in tqdm(range(0, len(all_chunks), BATCH_SIZE), desc="Embedding & Uploading"):
-            batch_chunks = all_chunks[i:i + BATCH_SIZE]
-            batch_codes = [c.code for c in batch_chunks]
+        for i in tqdm(range(0, len(all_chunks), UPLOAD_BATCH_SIZE), desc="Uploading"):
+            batch_chunks = all_chunks[i:i + UPLOAD_BATCH_SIZE]
+            batch_embeddings = embeddings_list[i:i + UPLOAD_BATCH_SIZE]
 
             try:
-                batch_embeddings = self._create_embeddings_batch(batch_codes)
-
                 if len(batch_embeddings) != len(batch_chunks):
                     logger.error(f"Embedding count mismatch: {len(batch_embeddings)} vs {len(batch_chunks)}")
                     failed_batches += 1
@@ -694,11 +728,8 @@ class OpenCVIndexer:
                     )
                     total_uploaded += len(points)
 
-                if (i // BATCH_SIZE) % 20 == 0 and i > 0:
-                    logger.info(f"Progress: {total_uploaded} points uploaded")
-
             except Exception as e:
-                logger.error(f"Error uploading batch {i // BATCH_SIZE}: {e}")
+                logger.error(f"Error uploading batch {i // UPLOAD_BATCH_SIZE}: {e}")
                 failed_batches += 1
                 continue
 
