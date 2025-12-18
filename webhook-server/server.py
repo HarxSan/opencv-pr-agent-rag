@@ -1,514 +1,278 @@
 import os
 import sys
-import json
+import logging
+import requests
 import hmac
 import hashlib
-import logging
 import threading
-import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List
-from dataclasses import asdict
-
-from flask import Flask, request, jsonify, Response
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-from config import load_config, Config, ModelConfig
+from flask import Flask, request, jsonify
+from github_app_auth import GitHubAppAuth
+from webhook_verifier import WebhookVerifier
+from multi_tenant_github import MultiTenantGitHubClient
 from rag_retriever import RAGRetriever
-from pr_agent_runner import PRAgentRunner
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/app/logs/server.log')
+    ]
 )
+
 logger = logging.getLogger(__name__)
+
+GITHUB_APP_ID = os.getenv('GITHUB_APP_ID')
+GITHUB_APP_PRIVATE_KEY_PATH = os.getenv('GITHUB_APP_PRIVATE_KEY_PATH')
+GITHUB_WEBHOOK_SECRET = os.getenv('GITHUB_WEBHOOK_SECRET')
+LIGHTNING_AI_ENDPOINT = os.getenv('LIGHTNING_AI_ENDPOINT')
+LIGHTNING_AI_MODEL_NAME = os.getenv('LIGHTNING_AI_MODEL_NAME')
+MODEL_MAX_TOKENS = int(os.getenv('MODEL_MAX_TOKENS', '4096'))
+MODEL_TEMPERATURE = float(os.getenv('MODEL_TEMPERATURE', '0.1'))
+
+if not all([GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_PATH, GITHUB_WEBHOOK_SECRET]):
+    logger.error("Missing required environment variables")
+    sys.exit(1)
 
 app = Flask(__name__)
 
-config: Optional[Config] = None
-rag_retriever: Optional[RAGRetriever] = None
-pr_agent_runner: Optional[PRAgentRunner] = None
-
-
-def reload_model_config():
-    import os
-    from config import ModelConfig
-    
-    new_model_config = ModelConfig()
-    
-    global config
-    if config:
-        old_endpoint = config.model.endpoint
-        old_model = config.model.model_name
-        
-        config.model = new_model_config
-        
-        if old_endpoint != new_model_config.endpoint or old_model != new_model_config.model_name:
-            logger.info(
-                f"Model config reloaded: "
-                f"{old_model} -> {new_model_config.model_name}, "
-                f"{old_endpoint} -> {new_model_config.endpoint}"
-            )
-
-
-class GitHubClient:
-    def __init__(self, cfg: Config):
-        self.config = cfg
-        self.session = self._create_session()
-        self._setup_auth()
-    
-    def _create_session(self) -> requests.Session:
-        session = requests.Session()
-        
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        
-        return session
-    
-    def _setup_auth(self):
-        if self.config.github.user_token:
-            self.session.headers['Authorization'] = f'token {self.config.github.user_token}'
-        self.session.headers['Accept'] = 'application/vnd.github.v3+json'
-        self.session.headers['User-Agent'] = 'OpenCV-PR-Agent-RAG/1.0'
-    
-    def _get_paginated(self, url: str, max_items: int = 500) -> List[Dict]:
-        items = []
-        page = 1
-        per_page = 100
-        
-        while len(items) < max_items:
-            params = {'page': page, 'per_page': per_page}
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            
-            page_items = response.json()
-            if not page_items:
-                break
-            
-            items.extend(page_items)
-            
-            if len(page_items) < per_page:
-                break
-            
-            page += 1
-            
-            if page > 10:
-                logger.warning(f"Reached pagination limit for {url}")
-                break
-        
-        return items[:max_items]
-    
-    def get_pr_info(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
-        url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
-        response = self.session.get(url, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    
-    def get_pr_files(self, owner: str, repo: str, pr_number: int) -> List[Dict]:
-        url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files'
-        return self._get_paginated(url, max_items=self.config.server.max_files_per_pr)
-    
-    def get_pr_diff(self, owner: str, repo: str, pr_number: int) -> str:
-        url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
-        headers = {'Accept': 'application/vnd.github.v3.diff'}
-        
-        response = self.session.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        diff = response.text
-        
-        if len(diff) > self.config.server.max_diff_size:
-            logger.warning(f"Diff truncated from {len(diff)} to {self.config.server.max_diff_size} bytes")
-            
-            lines = diff[:self.config.server.max_diff_size].split('\n')
-            last_complete = len(lines) - 1
-            for i in range(len(lines) - 1, -1, -1):
-                if lines[i].startswith('diff --git'):
-                    last_complete = i - 1
-                    break
-            
-            diff = '\n'.join(lines[:last_complete + 1])
-            diff += f"\n\n... (diff truncated, total size exceeded {self.config.server.max_diff_size // 1024 // 1024}MB limit)"
-        
-        return diff
-    
-    def post_comment(self, owner: str, repo: str, issue_number: int, body: str) -> Dict[str, Any]:
-        url = f'https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments'
-        response = self.session.post(url, json={'body': body}, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    
-    def add_reaction(self, owner: str, repo: str, comment_id: int, reaction: str) -> bool:
-        url = f'https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions'
-        headers = {'Accept': 'application/vnd.github+json'}
-        
-        try:
-            response = self.session.post(url, json={'content': reaction}, headers=headers, timeout=10)
-            return response.status_code in [200, 201]
-        except Exception as e:
-            logger.warning(f"Failed to add reaction: {e}")
-            return False
-
-
-def verify_github_signature(payload: bytes, signature: str, secret: str) -> bool:
-    if not signature:
-        return False
-    
-    if not signature.startswith('sha256='):
-        if signature.startswith('sha1='):
-            expected = 'sha1=' + hmac.new(
-                secret.encode('utf-8'),
-                payload,
-                hashlib.sha1
-            ).hexdigest()
-            return hmac.compare_digest(expected, signature)
-        return False
-    
-    expected = 'sha256=' + hmac.new(
-        secret.encode('utf-8'),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(expected, signature)
-
-
-def extract_pr_context(gh_client: GitHubClient, owner: str, repo: str,
-                       pr_number: int) -> Dict[str, Any]:
-    try:
-        logger.info(f"Fetching PR context for {owner}/{repo}#{pr_number}")
-        
-        pr_info = gh_client.get_pr_info(owner, repo, pr_number)
-        
-        files = gh_client.get_pr_files(owner, repo, pr_number)
-        changed_files = [f['filename'] for f in files]
-        
-        diff = gh_client.get_pr_diff(owner, repo, pr_number)
-        
-        context = {
-            'title': pr_info.get('title', ''),
-            'description': pr_info.get('body', '') or '',
-            'changed_files': changed_files,
-            'diff': diff,
-            'base_branch': pr_info.get('base', {}).get('ref', ''),
-            'head_branch': pr_info.get('head', {}).get('ref', ''),
-            'author': pr_info.get('user', {}).get('login', ''),
-            'additions': pr_info.get('additions', 0),
-            'deletions': pr_info.get('deletions', 0),
-            'changed_files_count': pr_info.get('changed_files', len(changed_files))
-        }
-        
-        logger.info(
-            f"PR Context: {len(changed_files)} files, "
-            f"{context['additions']}+ {context['deletions']}- lines, "
-            f"{len(diff)} bytes diff"
-        )
-        
-        return context
-        
-    except Exception as e:
-        logger.error(f"Failed to extract PR context: {e}")
-        return {}
-
-
-def is_valid_command_comment(comment_body: str) -> bool:
-    if not comment_body:
-        return False
-    
-    valid_commands = [
-        '/review', '/improve', '/ask', '/describe',
-        '/update_changelog', '/add_docs', '/test', '/help', '/config'
-    ]
-    
-    stripped = comment_body.strip()
-    return any(stripped.startswith(cmd) for cmd in valid_commands)
-
-
-def process_webhook_async(event_type: str, payload: Dict[str, Any]):
-    global config, pr_agent_runner
-    
-    start_time = time.time()
+try:
+    auth_manager = GitHubAppAuth(GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_PATH)
+    webhook_verifier = WebhookVerifier(GITHUB_WEBHOOK_SECRET)
+    github_client = MultiTenantGitHubClient(auth_manager)
     
     try:
-        if event_type == 'issue_comment':
-            action = payload.get('action')
-            if action not in ['created']:
-                return
-            
-            comment = payload.get('comment', {})
-            issue = payload.get('issue', {})
-            repo = payload.get('repository', {})
-            
-            if not issue.get('pull_request'):
-                logger.debug("Comment is not on a PR")
-                return
-            
-            comment_body = comment.get('body', '')
-            if not is_valid_command_comment(comment_body):
-                logger.debug(f"Not a command comment: {comment_body[:30]}...")
-                return
-            
-            owner = repo.get('owner', {}).get('login')
-            repo_name = repo.get('name')
-            pr_number = issue.get('number')
-            comment_id = comment.get('id')
-            
-            if not all([owner, repo_name, pr_number]):
-                logger.error("Missing required fields in payload")
-                return
-            
-            pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pr_number}"
-            
-            logger.info(f"Processing command on {pr_url}: {comment_body[:50]}...")
-            
-            reload_model_config()
-            
-            gh_client = GitHubClient(config)
-            
-            gh_client.add_reaction(owner, repo_name, comment_id, 'eyes')
-            
-            pr_context = extract_pr_context(gh_client, owner, repo_name, pr_number)
-            
-            if not pr_context:
-                gh_client.add_reaction(owner, repo_name, comment_id, 'confused')
-                gh_client.post_comment(
-                    owner, repo_name, pr_number,
-                    "⚠️ Failed to fetch PR information. Please try again."
-                )
-                return
-            
-            result = pr_agent_runner.process_comment(comment_body, pr_url, pr_context)
-            
-            if result:
-                elapsed = time.time() - start_time
-                
-                if result.get('success'):
-                    gh_client.add_reaction(owner, repo_name, comment_id, 'rocket')
-                    logger.info(
-                        f"Command /{result.get('command')} completed in {elapsed:.1f}s "
-                        f"(RAG: {result.get('rag_chunks', 0)} chunks)"
-                    )
-                else:
-                    gh_client.add_reaction(owner, repo_name, comment_id, 'confused')
-                    error_msg = result.get('error', result.get('stderr', 'Unknown error'))[:500]
-                    logger.error(f"Command failed: {error_msg}")
-                    
-                    gh_client.post_comment(
-                        owner, repo_name, pr_number,
-                        f"⚠️ PR-Agent command failed:\n```\n{error_msg}\n```"
-                    )
-        
-        elif event_type == 'pull_request':
-            action = payload.get('action')
-            logger.info(f"Received pull_request event: {action} (automatic triggers disabled)")
-    
+        rag_retriever = RAGRetriever()
+        logger.info("RAG retriever initialized successfully")
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
-
+        rag_retriever = None
+        logger.warning(f"RAG retriever initialization failed: {e}")
+    
+    logger.info("Server initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize server: {e}")
+    sys.exit(1)
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    health = {
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'version': '2.0.0',
-        'components': {}
-    }
+def health():
+    cache_stats = auth_manager.get_cache_stats()
     
+    rag_status = {'available': False, 'message': 'Not initialized'}
     if rag_retriever:
         try:
             rag_ok, rag_msg = rag_retriever.health_check()
-            health['components']['rag'] = {'ok': rag_ok, 'message': rag_msg}
-        except Exception as e:
-            health['components']['rag'] = {'ok': False, 'message': str(e)}
-    else:
-        health['components']['rag'] = {'ok': False, 'message': 'Not initialized'}
+            rag_status = {'available': rag_ok, 'message': rag_msg}
+        except:
+            rag_status = {'available': False, 'message': 'Health check failed'}
     
-    health['components']['model'] = {
-        'endpoint': config.model.endpoint if config else 'not configured',
-        'model': config.model.model_name if config else 'not configured'
-    }
-    
-    health['components']['github'] = {
-        'auth': 'app' if (config and config.github.is_app_configured()) else 'token' if (config and config.github.is_token_configured()) else 'none'
-    }
-    
-    health['config'] = {
-        'max_diff_size_mb': config.server.max_diff_size / 1024 / 1024 if config else 0,
-        'max_files': config.server.max_files_per_pr if config else 0,
-        'timeout_s': config.server.request_timeout if config else 0,
-        'rag_enabled_commands': config.rag.enabled_commands if config else []
-    }
-    
-    all_ok = all(
-        c.get('ok', True) for c in health['components'].values()
-        if isinstance(c, dict) and 'ok' in c
-    )
-    health['status'] = 'healthy' if all_ok else 'degraded'
-    
-    return jsonify(health), 200 if all_ok else 503
-
+    return jsonify({
+        'status': 'healthy',
+        'app_id': GITHUB_APP_ID,
+        'cached_installations': cache_stats['cached_installations'],
+        'model_endpoint': LIGHTNING_AI_ENDPOINT,
+        'rag': rag_status
+    })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    signature = request.headers.get('X-Hub-Signature-256', '') or request.headers.get('X-Hub-Signature', '')
+    payload_bytes = request.get_data()
     
-    if config.github.webhook_secret:
-        if not verify_github_signature(request.data, signature, config.github.webhook_secret):
-            logger.warning("Invalid webhook signature")
-            return jsonify({'error': 'Invalid signature'}), 401
+    if not webhook_verifier.verify_request(payload_bytes, request.headers):
+        logger.warning(f"Invalid webhook signature from {request.remote_addr}")
+        return jsonify({'error': 'Invalid signature'}), 401
     
-    event_type = request.headers.get('X-GitHub-Event', '')
-    delivery_id = request.headers.get('X-GitHub-Delivery', '')
-    
-    logger.info(f"Webhook received: event={event_type}, delivery={delivery_id}")
+    event_type = request.headers.get('X-GitHub-Event')
+    payload = request.json
     
     if event_type == 'ping':
-        return jsonify({'message': 'pong', 'delivery_id': delivery_id}), 200
+        logger.info("Received ping event")
+        return jsonify({'message': 'Pong'}), 200
     
-    if event_type not in ['issue_comment', 'pull_request']:
-        return jsonify({'message': f'Event {event_type} not handled'}), 200
-    
-    try:
-        payload = request.get_json()
-    except Exception as e:
-        logger.error(f"Failed to parse payload: {e}")
-        return jsonify({'error': 'Invalid JSON'}), 400
-    
-    thread = threading.Thread(
-        target=process_webhook_async,
-        args=(event_type, payload),
-        daemon=True
-    )
-    thread.start()
-    
-    return jsonify({'message': 'Processing', 'delivery_id': delivery_id}), 202
-
-
-@app.route('/test', methods=['POST'])
-def test_endpoint():
-    try:
-        data = request.get_json()
-        pr_url = data.get('pr_url')
-        command = data.get('command', 'review')
-        
-        if not pr_url:
-            return jsonify({'error': 'pr_url required'}), 400
-        
-        parts = pr_url.rstrip('/').split('/')
-        owner = parts[-4]
-        repo = parts[-3]
-        pr_number = int(parts[-1])
-        
-        reload_model_config()
-        
-        gh_client = GitHubClient(config)
-        pr_context = extract_pr_context(gh_client, owner, repo, pr_number)
-        
-        if not pr_context:
-            return jsonify({'error': 'Failed to fetch PR context'}), 500
-        
-        result = pr_agent_runner.run_command(
-            pr_url=pr_url,
-            command=command,
-            pr_context=pr_context
+    if event_type == 'issue_comment':
+        thread = threading.Thread(
+            target=handle_issue_comment_async,
+            args=(payload,),
+            daemon=True
         )
+        thread.start()
+        return jsonify({'message': 'Processing'}), 202
+    
+    if event_type == 'pull_request':
+        return handle_pull_request(payload)
+    
+    logger.info(f"Unhandled event type: {event_type}")
+    return jsonify({'message': 'Event received'}), 200
+
+def handle_issue_comment_async(payload: dict):
+    try:
+        action = payload.get('action')
+        if action != 'created':
+            return
         
-        return jsonify(result)
+        if 'pull_request' not in payload.get('issue', {}):
+            return
+        
+        comment_body = payload['comment']['body'].strip()
+        if not comment_body.startswith('/'):
+            return
+        
+        installation_id = payload['installation']['id']
+        repo_full_name = payload['repository']['full_name']
+        pr_number = payload['issue']['number']
+        comment_id = payload['comment']['id']
+        commenter = payload['comment']['user']['login']
+        
+        logger.info(f"Processing '{comment_body}' from {commenter} on PR #{pr_number} in {repo_full_name}")
+        
+        owner, repo = repo_full_name.split('/')
+        
+        try:
+            github_client.get_client(installation_id).get_user().login
+            react_result = requests.post(
+                f'https://api.github.com/repos/{repo_full_name}/issues/comments/{comment_id}/reactions',
+                headers={
+                    'Authorization': f'Bearer {auth_manager.get_installation_token(installation_id)}',
+                    'Accept': 'application/vnd.github+json'
+                },
+                json={'content': 'eyes'},
+                timeout=10
+            )
+        except:
+            pass
+        
+        if comment_body == '/review':
+            process_review_command(installation_id, repo_full_name, pr_number)
         
     except Exception as e:
-        logger.error(f"Test error: {e}", exc_info=True)
+        logger.error(f"Error in async handler: {e}", exc_info=True)
+
+def handle_pull_request(payload: dict):
+    try:
+        action = payload.get('action')
+        if action not in ['opened', 'synchronize', 'reopened']:
+            return jsonify({'message': 'Ignored'}), 200
+        
+        logger.info(f"PR {action}: {payload['pull_request']['title']}")
+        return jsonify({'message': 'PR event received'}), 200
+        
+    except Exception as e:
+        logger.error(f"Error handling PR event: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-
-@app.route('/context', methods=['POST'])
-def get_context():
+def process_review_command(installation_id: int, repo_full_name: str, pr_number: int):
     try:
-        data = request.get_json()
+        logger.info(f"Fetching PR details for #{pr_number} in {repo_full_name}")
+        pr_details = github_client.get_pr_details(installation_id, repo_full_name, pr_number)
         
-        if not rag_retriever:
-            return jsonify({'error': 'RAG not initialized'}), 503
+        diff = github_client.get_pr_diff(installation_id, pr_details['diff_url'])
+        if not diff:
+            logger.warning(f"Could not fetch diff for PR #{pr_number}")
+            diff = ""
         
-        chunks = rag_retriever.retrieve(
-            pr_title=data.get('title', ''),
-            pr_description=data.get('description', ''),
-            changed_files=data.get('changed_files', []),
-            diff=data.get('diff', '')
+        rag_chunks = []
+        if rag_retriever:
+            logger.info(f"Fetching RAG context for PR #{pr_number}")
+            try:
+                rag_chunks = rag_retriever.retrieve(
+                    pr_title=pr_details['title'],
+                    pr_description=pr_details['body'],
+                    changed_files=[f['filename'] for f in pr_details['changed_files']],
+                    diff=diff
+                )
+                logger.info(f"Retrieved {len(rag_chunks)} RAG chunks")
+            except Exception as e:
+                logger.warning(f"RAG retrieval failed: {e}")
+        else:
+            logger.info("RAG not available, proceeding without context")
+        
+        logger.info(f"Generating review for PR #{pr_number} with {len(rag_chunks)} RAG chunks")
+        review = generate_review(pr_details, diff, rag_chunks)
+        
+        formatted_review = f"""## 🤖 AI-Powered Code Review
+
+{review}
+
+---
+*Review generated by OpenCV PR Agent with RAG-enhanced context*  
+*Found {len(rag_chunks)} relevant code chunks from the codebase*
+"""
+        
+        success = github_client.post_pr_comment(
+            installation_id, 
+            repo_full_name, 
+            pr_number, 
+            formatted_review
         )
         
-        context = rag_retriever.format_context(chunks)
-        
-        return jsonify({
-            'success': True,
-            'count': len(chunks),
-            'context_size': len(context),
-            'chunks': [
-                {
-                    'file_path': c.file_path,
-                    'module': c.module,
-                    'chunk_type': c.chunk_type,
-                    'relevance_score': round(c.relevance_score, 3),
-                    'lines': f"{c.start_line}-{c.end_line}",
-                    'code_preview': c.code[:200] + '...' if len(c.code) > 200 else c.code
-                }
-                for c in chunks
-            ],
-            'formatted_context': context[:5000] + '...' if len(context) > 5000 else context
-        })
-        
+        if success:
+            logger.info(f"Successfully posted review to PR #{pr_number}")
+        else:
+            logger.error(f"Failed to post review to PR #{pr_number}")
+            
     except Exception as e:
-        logger.error(f"Context error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error processing review: {e}", exc_info=True)
 
-
-def init_app():
-    global config, rag_retriever, pr_agent_runner
-    
-    logger.info("=" * 70)
-    logger.info("OpenCV PR-Agent RAG v2.0 - Starting")
-    logger.info("=" * 70)
-    
-    config = load_config()
-    config.log_config()
-    
-    errors = config.validate()
-    if errors:
-        for error in errors:
-            logger.error(f"Config error: {error}")
-        logger.warning("Starting with incomplete configuration")
-    
+def generate_review(pr_details: dict, diff: str, rag_chunks: list) -> str:
     try:
-        rag_retriever = RAGRetriever(config.qdrant, config.rag)
-        logger.info("RAG retriever initialized")
+        if rag_chunks:
+            context_text = "\n\n".join([
+                f"File: {chunk.file_path}\nModule: {chunk.module}\nLines {chunk.start_line}-{chunk.end_line}:\n{chunk.code[:400]}"
+                for chunk in rag_chunks[:10]
+            ])
+        else:
+            context_text = "No relevant context found in codebase"
+        
+        changed_files_summary = ', '.join([f['filename'] for f in pr_details['changed_files'][:10]])
+        if len(pr_details['changed_files']) > 10:
+            changed_files_summary += f" (+{len(pr_details['changed_files']) - 10} more)"
+        
+        max_diff_length = 6000
+        if len(diff) > max_diff_length:
+            diff = diff[:max_diff_length] + f"\n... (diff truncated, {len(diff) - max_diff_length} chars omitted)"
+        
+        max_context_length = 4000
+        if len(context_text) > max_context_length:
+            context_text = context_text[:max_context_length] + "\n... (context truncated)"
+        
+        prompt = f"""You are an expert OpenCV code reviewer. Review this pull request.
+
+PR Title: {pr_details['title']}
+Author: {pr_details['author']}
+Changed Files: {changed_files_summary}
+
+Relevant Code Context from Codebase:
+{context_text}
+
+PR Diff:
+{diff}
+
+Provide a concise code review focusing on:
+1. Correctness and potential bugs
+2. OpenCV API usage and best practices
+3. Memory management and performance
+4. Code quality and maintainability
+
+Keep the review focused and actionable. Be specific with line numbers and code snippets where relevant."""
+
+        response = requests.post(
+            f'{LIGHTNING_AI_ENDPOINT}/v1/chat/completions',
+            json={
+                'model': LIGHTNING_AI_MODEL_NAME,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': MODEL_MAX_TOKENS,
+                'temperature': MODEL_TEMPERATURE
+            },
+            timeout=120
+        )
+        response.raise_for_status()
+        
+        return response.json()['choices'][0]['message']['content']
+        
     except Exception as e:
-        logger.error(f"RAG init failed: {e}")
-        rag_retriever = None
-    
-    pr_agent_runner = PRAgentRunner(config, rag_retriever)
-    logger.info("PR-Agent runner initialized")
-    
-    logger.info("=" * 70)
-    logger.info("Server ready - waiting for webhooks")
-    logger.info("=" * 70)
-
-
-init_app()
-
+        logger.error(f"Review generation failed: {e}")
+        return f"Failed to generate review: {str(e)}"
 
 if __name__ == '__main__':
-    app.run(
-        host=config.server.host,
-        port=config.server.port,
-        debug=False,
-        threaded=True
-    )
+    port = int(os.getenv('SERVER_PORT', '5000'))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
