@@ -1,16 +1,18 @@
 services:
   qdrant:
-    image: qdrant/qdrant:v1.12.5
+    image: qdrant/qdrant:v1.16.2
     container_name: opencv-qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - ./data/qdrant:/qdrant/storage
+      - ./data/qdrant:/qdrant/storage:rw
     environment:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
       - QDRANT__SERVICE__GRPC_PORT=6334
       - QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS=2
+      - QDRANT__STORAGE__PERFORMANCE__MAX_OPTIMIZATION_THREADS=2
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
     networks:
       - opencv-network
     restart: unless-stopped
