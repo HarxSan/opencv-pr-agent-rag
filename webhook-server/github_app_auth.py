@@ -6,16 +6,16 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 class GitHubAppAuth:
-    
+
     def __init__(self, app_id: str, private_key_path: str):
-        self.app_id = app_id
+        self.app_id = int(app_id)
         self.private_key = self._load_private_key(private_key_path)
         self._token_cache: Dict[int, Dict] = {}
+        self._jwt_cache: Optional[Dict] = None
         self._cache_lock = threading.Lock()
         self._session = requests.Session()
         self._session.headers.update({
@@ -30,15 +30,31 @@ class GitHubAppAuth:
         with open(path, 'rb') as f:
             return f.read()
     
-    @lru_cache(maxsize=1)
     def _generate_jwt(self) -> str:
-        now = int(time.time())
-        payload = {
-            'iat': now - 60,
-            'exp': now + 600,
-            'iss': self.app_id
-        }
-        return jwt.encode(payload, self.private_key, algorithm='RS256')
+        with self._cache_lock:
+            # Check if we have a cached JWT that's still valid
+            if self._jwt_cache:
+                # JWT is valid if it expires more than 60 seconds from now
+                if self._jwt_cache['exp'] > int(time.time()) + 60:
+                    logger.debug("Using cached JWT")
+                    return self._jwt_cache['token']
+
+            # Generate new JWT
+            now = int(time.time())
+            payload = {
+                'iat': now - 60,
+                'exp': now + 600,
+                'iss': self.app_id
+            }
+            token = jwt.encode(payload, self.private_key, algorithm='RS256')
+
+            # Cache the JWT with its expiration time
+            self._jwt_cache = {
+                'token': token,
+                'exp': now + 600
+            }
+            logger.debug(f"Generated new JWT, expires at {now + 600}")
+            return token
     
     def _is_token_valid(self, token_data: Dict) -> bool:
         if not token_data:

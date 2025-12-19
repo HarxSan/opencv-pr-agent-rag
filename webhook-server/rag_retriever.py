@@ -86,14 +86,10 @@ class RAGRetriever:
                 prefer_grpc=False,
                 https=False
             )
-            # Don't verify on initialization - do it lazily on first retrieval
         return self._client
     
     def _verify_collection_with_retry(self, max_retries: int = 3, retry_delay: int = 2) -> bool:
-        """
-        Verify collection exists and is ready, with retry logic.
-        This handles the case where Qdrant is starting up and collection is still loading.
-        """
+
         if self._collection_verified:
             return True
             
@@ -111,8 +107,7 @@ class RAGRetriever:
                         time.sleep(retry_delay)
                         continue
                     return False
-                
-                # Collection exists, check if it has points
+
                 info = self.client.get_collection(self.qdrant_config.collection_name)
                 points_count = info.points_count or 0
                 
@@ -319,10 +314,7 @@ class RAGRetriever:
     
     def retrieve(self, pr_title: str, pr_description: str,
                  changed_files: List[str], diff: str) -> List[CodeChunk]:
-        """
-        Retrieve relevant code chunks with proper error handling for Qdrant unavailability.
-        """
-        # Verify collection is ready (with retry logic)
+
         if not self._verify_collection_with_retry():
             logger.error("RAG retrieval skipped: Qdrant collection not available")
             return []
@@ -492,7 +484,7 @@ class RAGRetriever:
         return result
     
     def health_check(self) -> Tuple[bool, str]:
-        """Health check with retry logic for startup scenarios"""
+
         try:
             if not self._verify_collection_with_retry(max_retries=1, retry_delay=1):
                 return False, "Collection not available or empty"

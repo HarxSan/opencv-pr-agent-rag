@@ -75,20 +75,18 @@ If the context doesn't contain relevant information, say so clearly."""
         
         return "\n".join(parts)
     
-    def _setup_config_directory(self, extra_instructions: str = "") -> Path:
+    def _setup_config_directory(self, extra_instructions: str = "", skip_github_auth: bool = False) -> Path:
         if self._config_dir and self._config_dir.exists():
             shutil.rmtree(self._config_dir)
-        
+
         config_dir = Path(tempfile.mkdtemp(prefix="pr_agent_"))
         settings_dir = config_dir / "pr_agent" / "settings"
         settings_dir.mkdir(parents=True, exist_ok=True)
-        
+
         escaped_instructions = extra_instructions.replace('"""', '\\"\\"\\"').replace("'''", "\\'\\'\\'")
-        
+
         model_name = self.config.model.model_name
-        api_base = self.config.model.api_base.rstrip('/')
-        if not api_base.endswith('/v1'):
-            api_base = f"{api_base}/v1"
+        api_base = self.config.model.api_base
         
         config_toml = f'''[config]
 git_provider = "github"
@@ -104,6 +102,7 @@ fallback_models = ["openai/{model_name}"]
 custom_model_max_tokens = {self.config.model.max_tokens}
 max_model_tokens = {self.config.model.max_tokens}
 duplicate_examples = true
+model_temperature = {self.config.model.temperature}
 
 ai_timeout = {self.config.server.request_timeout}
 large_patch_policy = "clip"
@@ -166,24 +165,25 @@ auto_improve = false
 '''
         
         (settings_dir / "configuration.toml").write_text(config_toml)
-        
+
         secrets_toml = f'''[openai]
 key = "{self.config.model.api_key}"
 api_base = "{api_base}"
+'''
 
+        if not skip_github_auth:
+            secrets_toml += f'''
 [github]
 user_token = "{self.config.github.user_token or ''}"
 '''
-        
-        if self.config.github.is_app_configured():
-            secrets_toml += f'''
-app_id = "{self.config.github.app_id}"
+            if self.config.github.is_app_configured():
+                secrets_toml += f'''app_id = "{self.config.github.app_id}"
 webhook_secret = "{self.config.github.webhook_secret or ''}"
 '''
-            private_key = self.config.github.private_key
-            if private_key:
-                escaped_key = private_key.replace('"', '\\"')
-                secrets_toml += f'private_key = """{escaped_key}"""\n'
+                private_key = self.config.github.private_key
+                if private_key:
+                    escaped_key = private_key.replace('"', '\\"')
+                    secrets_toml += f'private_key = """{escaped_key}"""\n'
         
         secrets_path = settings_dir / ".secrets.toml"
         secrets_path.write_text(secrets_toml)
@@ -197,11 +197,9 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
     
     def _build_environment(self, config_dir: Path) -> Dict[str, str]:
         env = os.environ.copy()
-        
-        api_base = self.config.model.api_base.rstrip('/')
-        if not api_base.endswith('/v1'):
-            api_base = f"{api_base}/v1"
-        
+
+        api_base = self.config.model.api_base
+
         env['OPENAI_API_KEY'] = self.config.model.api_key
         env['OPENAI_API_BASE'] = api_base
         env['OPENAI__KEY'] = self.config.model.api_key
@@ -280,17 +278,17 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
             return ""
     
     def run_command(self, pr_url: str, command: str, args: Optional[str] = None,
-                    pr_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        
+                    pr_context: Optional[Dict[str, Any]] = None, skip_github_auth: bool = False) -> Dict[str, Any]:
+
         logger.info(f"Running /{command} on {pr_url}")
-        
+
         rag_context = ""
         if pr_context:
             rag_context = self._retrieve_rag_context(command, pr_context)
-        
+
         extra_instructions = self._build_extra_instructions(command, rag_context, args if command == 'ask' else None)
-        
-        config_dir = self._setup_config_directory(extra_instructions)
+
+        config_dir = self._setup_config_directory(extra_instructions, skip_github_auth)
         env = self._build_environment(config_dir)
         
         cli_args = [

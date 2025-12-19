@@ -67,6 +67,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      - ./webhook-server:/app 
       - ./data/logs:/app/logs
       - ./data/cache:/app/cache
       - ./secrets:/app/secrets:ro
