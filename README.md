@@ -6,7 +6,7 @@ Production-grade PR review system for OpenCV using Qodo PR-Agent with custom RAG
 
 - **Comment-triggered only**: No automatic PR creation triggers - all commands invoked via comments
 - **RAG-enhanced reviews**: Injects relevant OpenCV codebase context for better reviews
-- **Custom model support**: Uses your fine-tuned Qwen 2.5 Coder model via Lightning AI
+- **Custom model support**: Uses your fine-tuned Qwen 2.5 Coder model via any vLLM-compatible endpoint
 - **Large PR support**: Handles PRs up to 10MB diff size and 500 files
 - **All PR-Agent commands**: /review, /improve, /ask, /describe, /update_changelog, /add_docs, /test
 
@@ -23,7 +23,7 @@ GitHub PR Comment (/review)
     ↓       ↓
  Qdrant   PR-Agent CLI
   RAG         ↓
-    ↓    Lightning AI
+    ↓    vLLM Model Endpoint
     └───────┬───────┘
             ↓
     Review posted to PR
@@ -90,7 +90,8 @@ GitHub PR Comment (/review)
 |----------|-------------|
 | `GITHUB_USER_TOKEN` | GitHub PAT with repo access |
 | `OPENCV_REPO_PATH` | Local path to OpenCV clone |
-| `LIGHTNING_AI_ENDPOINT` | Your model endpoint URL |
+| `MODEL_ENDPOINT` | Your vLLM-compatible model endpoint URL |
+| `MODEL_NAME` | Model name (e.g., nareshmlx/code-reviewer-opencv-harxsan-v2) |
 
 ### Optional Settings
 

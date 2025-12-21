@@ -47,16 +47,28 @@ class ModelConfig:
     max_tokens: int = 32000
     temperature: float = 0.3
     api_key: str = "not-used"
-    
+
     def __post_init__(self):
-        self.endpoint = os.getenv(
+        self.endpoint = os.getenv("MODEL_ENDPOINT") or os.getenv(
             "LIGHTNING_AI_ENDPOINT",
-            "https://3000-01kbs5g1xhxxrzv5rh00t479a4.cloudspaces.litng.ai"
-        ).rstrip("/")
-        self.model_name = os.getenv("LIGHTNING_AI_MODEL_NAME", "nareshmlx/code-reviewer-opencv-harxsan-v2")
+            "https://midi-medieval-court-hosting.trycloudflare.com"
+        )
+        self.endpoint = self.endpoint.rstrip("/")
+
+        self.model_name = os.getenv("MODEL_NAME") or os.getenv(
+            "LIGHTNING_AI_MODEL_NAME",
+            "nareshmlx/code-reviewer-opencv-harxsan-v2"
+        )
+
         self.max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "32000"))
         self.temperature = float(os.getenv("MODEL_TEMPERATURE", "0.3"))
-        self.api_key = os.getenv("LIGHTNING_AI_API_KEY", "not-used")
+
+        self.api_key = (
+            os.getenv("VLLM_API_KEY") or
+            os.getenv("MODEL_API_KEY") or
+            os.getenv("LIGHTNING_AI_API_KEY") or
+            "not-used"
+        )
     
     @property
     def api_base(self) -> str:

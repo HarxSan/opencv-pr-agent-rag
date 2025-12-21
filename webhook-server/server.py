@@ -77,7 +77,7 @@ def initialize_components():
             logger.warning(f"RAG initialization failed: {e}")
             rag_retriever = None
 
-        pr_agent_runner = PRAgentRunner(config, rag_retriever)
+        pr_agent_runner = PRAgentRunner(config, rag_retriever, auth_manager)
         logger.info("PR-Agent runner initialized")
 
         logger.info("All components initialized successfully")
@@ -191,7 +191,7 @@ def handle_issue_comment_async(payload: dict):
         elif pat_client:
             pr_context = fetch_pr_context_pat(repo_full_name, pr_number)
 
-        result = pr_agent_runner.process_comment(comment_body, pr_url, pr_context)
+        result = pr_agent_runner.process_comment(comment_body, pr_url, pr_context, installation_id)
 
         if result:
             if result['success']:

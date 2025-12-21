@@ -64,10 +64,17 @@ services:
       context: ./webhook-server
       dockerfile: Dockerfile
     container_name: opencv-pr-agent-rag
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "api.github.com:20.207.73.85"
+      - "github.com:20.207.73.82"
+      - "huggingface.co:108.158.251.89"
     ports:
       - "5000:5000"
     volumes:
-      - ./webhook-server:/app 
+      - ./webhook-server:/app
       - ./data/logs:/app/logs
       - ./data/cache:/app/cache
       - ./secrets:/app/secrets:ro
@@ -78,11 +85,14 @@ services:
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
       - GITHUB_USER_TOKEN=${GITHUB_USER_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-HarxSan/opencv}
-      - LIGHTNING_AI_ENDPOINT=${LIGHTNING_AI_ENDPOINT:-https://3000-01kbs5g1xhxxrzv5rh00t479a4.cloudspaces.litng.ai}
-      - LIGHTNING_AI_MODEL_NAME=${LIGHTNING_AI_MODEL_NAME:-nareshmlx/code-reviewer-opencv-harxsan-v2}
-      - LIGHTNING_AI_API_KEY=${LIGHTNING_AI_API_KEY:-not-used}
+      - MODEL_ENDPOINT=${MODEL_ENDPOINT:-https://midi-medieval-court-hosting.trycloudflare.com}
+      - MODEL_NAME=${MODEL_NAME:-nareshmlx/code-reviewer-opencv-harxsan-v2}
+      - VLLM_API_KEY=${VLLM_API_KEY:-not-used}
       - MODEL_MAX_TOKENS=${MODEL_MAX_TOKENS:-32000}
       - MODEL_TEMPERATURE=${MODEL_TEMPERATURE:-0.1}
+      - LIGHTNING_AI_ENDPOINT=${LIGHTNING_AI_ENDPOINT:-}
+      - LIGHTNING_AI_MODEL_NAME=${LIGHTNING_AI_MODEL_NAME:-}
+      - LIGHTNING_AI_API_KEY=${LIGHTNING_AI_API_KEY:-}
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}

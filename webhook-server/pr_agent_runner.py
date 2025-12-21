@@ -3,12 +3,15 @@ import subprocess
 import os
 import shutil
 import tempfile
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from pathlib import Path
 import re
 
 from config import Config
 from rag_retriever import RAGRetriever
+
+if TYPE_CHECKING:
+    from github_app_auth import GitHubAppAuth
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +24,10 @@ RAG_CONTEXT_COMMANDS = {'review', 'improve', 'ask'}
 
 
 class PRAgentRunner:
-    def __init__(self, config: Config, rag_retriever: Optional[RAGRetriever]):
+    def __init__(self, config: Config, rag_retriever: Optional[RAGRetriever], auth_manager: Optional['GitHubAppAuth'] = None):
         self.config = config
         self.rag_retriever = rag_retriever
+        self.auth_manager = auth_manager
         self._config_dir: Optional[Path] = None
     
     def _get_base_instructions(self, command: str) -> str:
@@ -75,7 +79,8 @@ If the context doesn't contain relevant information, say so clearly."""
         
         return "\n".join(parts)
     
-    def _setup_config_directory(self, extra_instructions: str = "", skip_github_auth: bool = False) -> Path:
+    def _setup_config_directory(self, extra_instructions: str = "", skip_github_auth: bool = False,
+                                 installation_token: Optional[str] = None) -> Path:
         if self._config_dir and self._config_dir.exists():
             shutil.rmtree(self._config_dir)
 
@@ -87,10 +92,12 @@ If the context doesn't contain relevant information, say so clearly."""
 
         model_name = self.config.model.model_name
         api_base = self.config.model.api_base
-        
+
+        publish_output = "false" if skip_github_auth else "true"
+
         config_toml = f'''[config]
 git_provider = "github"
-publish_output = true
+publish_output = {publish_output}
 publish_output_progress = true
 verbosity_level = 2
 use_repo_settings_file = false
@@ -98,7 +105,7 @@ use_wiki_settings_file = false
 use_global_settings_file = false
 
 model = "openai/{model_name}"
-fallback_models = ["openai/{model_name}"]
+fallback_models = []
 custom_model_max_tokens = {self.config.model.max_tokens}
 max_model_tokens = {self.config.model.max_tokens}
 duplicate_examples = true
@@ -172,18 +179,11 @@ api_base = "{api_base}"
 '''
 
         if not skip_github_auth:
+            github_token = installation_token or self.config.github.user_token or ''
             secrets_toml += f'''
 [github]
-user_token = "{self.config.github.user_token or ''}"
+user_token = "{github_token}"
 '''
-            if self.config.github.is_app_configured():
-                secrets_toml += f'''app_id = "{self.config.github.app_id}"
-webhook_secret = "{self.config.github.webhook_secret or ''}"
-'''
-                private_key = self.config.github.private_key
-                if private_key:
-                    escaped_key = private_key.replace('"', '\\"')
-                    secrets_toml += f'private_key = """{escaped_key}"""\n'
         
         secrets_path = settings_dir / ".secrets.toml"
         secrets_path.write_text(secrets_toml)
@@ -199,28 +199,35 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
         env = os.environ.copy()
 
         api_base = self.config.model.api_base
+        timeout_str = str(self.config.server.request_timeout)
 
         env['OPENAI_API_KEY'] = self.config.model.api_key
         env['OPENAI_API_BASE'] = api_base
         env['OPENAI__KEY'] = self.config.model.api_key
         env['OPENAI__API_BASE'] = api_base
-        
+
+        env['LITELLM_TIMEOUT'] = timeout_str
+        env['OPENAI_TIMEOUT'] = timeout_str
+        env['REQUEST_TIMEOUT'] = timeout_str
+        env['LITELLM_REQUEST_TIMEOUT'] = timeout_str
+
         env['CONFIG__GIT_PROVIDER'] = 'github'
         env['CONFIG__MODEL'] = f'openai/{self.config.model.model_name}'
         env['CONFIG__CUSTOM_MODEL_MAX_TOKENS'] = str(self.config.model.max_tokens)
         env['CONFIG__DUPLICATE_EXAMPLES'] = 'true'
-        
+        env['CONFIG__AI_TIMEOUT'] = timeout_str
+
         if self.config.github.user_token:
             env['GITHUB__USER_TOKEN'] = self.config.github.user_token
-        
+
         if self.config.github.is_app_configured():
             env['GITHUB__APP_ID'] = self.config.github.app_id
             if self.config.github.webhook_secret:
                 env['GITHUB__WEBHOOK_SECRET'] = self.config.github.webhook_secret
-        
+
         settings_path = config_dir / "pr_agent" / "settings"
         env['PR_AGENT_SETTINGS_PATH'] = str(settings_path)
-        
+
         return env
     
     def _parse_command(self, comment_body: str) -> tuple[Optional[str], Optional[str]]:
@@ -278,9 +285,18 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
             return ""
     
     def run_command(self, pr_url: str, command: str, args: Optional[str] = None,
-                    pr_context: Optional[Dict[str, Any]] = None, skip_github_auth: bool = False) -> Dict[str, Any]:
+                    pr_context: Optional[Dict[str, Any]] = None, skip_github_auth: bool = False,
+                    installation_id: Optional[int] = None) -> Dict[str, Any]:
 
         logger.info(f"Running /{command} on {pr_url}")
+
+        installation_token = None
+        if installation_id and self.auth_manager:
+            try:
+                installation_token = self.auth_manager.get_installation_token(installation_id)
+                logger.debug(f"Obtained installation token for installation {installation_id}")
+            except Exception as e:
+                logger.error(f"Failed to get installation token: {e}")
 
         rag_context = ""
         if pr_context:
@@ -288,7 +304,7 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
 
         extra_instructions = self._build_extra_instructions(command, rag_context, args if command == 'ask' else None)
 
-        config_dir = self._setup_config_directory(extra_instructions, skip_github_auth)
+        config_dir = self._setup_config_directory(extra_instructions, skip_github_auth, installation_token)
         env = self._build_environment(config_dir)
         
         cli_args = [
@@ -378,13 +394,14 @@ webhook_secret = "{self.config.github.webhook_secret or ''}"
                 self._config_dir = None
     
     def process_comment(self, comment_body: str, pr_url: str,
-                        pr_context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                        pr_context: Optional[Dict[str, Any]] = None,
+                        installation_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         command, args = self._parse_command(comment_body)
-        
+
         if not command:
             logger.debug(f"Not a valid command: {comment_body[:50]}...")
             return None
-        
+
         logger.info(f"Processing /{command}" + (f" with args: {args[:50]}..." if args else ""))
-        
-        return self.run_command(pr_url, command, args, pr_context)
+
+        return self.run_command(pr_url, command, args, pr_context, installation_id=installation_id)

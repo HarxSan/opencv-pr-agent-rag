@@ -60,7 +60,7 @@ class PRReviewCLI:
         else:
             logger.warning("No GitHub token configured - cannot fetch PR context or post reviews")
 
-        self.pr_agent_runner = PRAgentRunner(self.config, self.rag_retriever)
+        self.pr_agent_runner = PRAgentRunner(self.config, self.rag_retriever, auth_manager=None)
         logger.info("PR-Agent runner initialized")
 
     def parse_pr_url(self, pr_url: str) -> Optional[tuple]:
