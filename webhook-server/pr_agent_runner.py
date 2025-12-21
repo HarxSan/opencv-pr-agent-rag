@@ -184,18 +184,20 @@ api_base = "{api_base}"
 [github]
 user_token = "{github_token}"
 '''
-        
+            token_source = "installation" if installation_token else "PAT" if self.config.github.user_token else "none"
+            logger.info(f"Writing to .secrets.toml - token source: {token_source}, token length: {len(github_token)}, prefix: {github_token[:10] if github_token else 'None'}")
+
         secrets_path = settings_dir / ".secrets.toml"
         secrets_path.write_text(secrets_toml)
         os.chmod(secrets_path, 0o600)
-        
+
         self._config_dir = config_dir
         logger.info(f"PR-Agent config: model={model_name}, api_base={api_base}")
         logger.debug(f"Config directory: {config_dir}")
         
         return config_dir
     
-    def _build_environment(self, config_dir: Path) -> Dict[str, str]:
+    def _build_environment(self, config_dir: Path, installation_token: Optional[str] = None) -> Dict[str, str]:
         env = os.environ.copy()
 
         api_base = self.config.model.api_base
@@ -217,8 +219,9 @@ user_token = "{github_token}"
         env['CONFIG__DUPLICATE_EXAMPLES'] = 'true'
         env['CONFIG__AI_TIMEOUT'] = timeout_str
 
-        if self.config.github.user_token:
-            env['GITHUB__USER_TOKEN'] = self.config.github.user_token
+        github_token = installation_token or self.config.github.user_token
+        if github_token:
+            env['GITHUB__USER_TOKEN'] = github_token
 
         if self.config.github.is_app_configured():
             env['GITHUB__APP_ID'] = self.config.github.app_id
@@ -294,7 +297,7 @@ user_token = "{github_token}"
         if installation_id and self.auth_manager:
             try:
                 installation_token = self.auth_manager.get_installation_token(installation_id)
-                logger.debug(f"Obtained installation token for installation {installation_id}")
+                logger.info(f"Fetched installation token for {installation_id}: length={len(installation_token)}, prefix={installation_token[:10] if installation_token else 'None'}")
             except Exception as e:
                 logger.error(f"Failed to get installation token: {e}")
 
@@ -305,7 +308,7 @@ user_token = "{github_token}"
         extra_instructions = self._build_extra_instructions(command, rag_context, args if command == 'ask' else None)
 
         config_dir = self._setup_config_directory(extra_instructions, skip_github_auth, installation_token)
-        env = self._build_environment(config_dir)
+        env = self._build_environment(config_dir, installation_token)
         
         cli_args = [
             'python', '-m', 'pr_agent.cli',
@@ -319,6 +322,9 @@ user_token = "{github_token}"
         logger.info(f"Executing: pr_agent.cli {command}")
         logger.info(f"Model: openai/{self.config.model.model_name}")
         logger.info(f"API Base: {env.get('OPENAI_API_BASE')}")
+        logger.info(f"CLI Args: {' '.join(cli_args)}")
+        logger.info(f"Skip GitHub Auth: {skip_github_auth}")
+        logger.info(f"Has Installation Token: {installation_token is not None}")
         
         try:
             result = subprocess.run(
@@ -331,12 +337,31 @@ user_token = "{github_token}"
             )
             
             success = result.returncode == 0
-            
+
             if result.stdout:
+                stdout_lower = result.stdout.lower()
+                is_help_text = 'usage:' in stdout_lower and 'positional arguments:' in stdout_lower
+                is_review_started = 'reviewing pr:' in stdout_lower
+
+                if is_help_text:
+                    logger.error("PR-Agent showed help text instead of running command")
+                    logger.error(f"FULL STDOUT:\n{result.stdout}")
+                    success = False
+                elif not is_review_started and command == 'review':
+                    logger.error("PR-Agent did not start review process")
+                    logger.error(f"FULL STDOUT:\n{result.stdout}")
+                    success = False
+
                 for line in result.stdout.strip().split('\n')[-20:]:
                     logger.info(f"[PR-Agent stdout] {line}")
-            
+
             if result.stderr:
+                stderr_lower = result.stderr.lower()
+                has_errors = 'error' in stderr_lower or 'exception' in stderr_lower or 'traceback' in stderr_lower
+
+                if has_errors or not success:
+                    logger.error(f"FULL STDERR:\n{result.stderr}")
+
                 stderr_lines = result.stderr.strip().split('\n')
                 for line in stderr_lines[-30:]:
                     if 'error' in line.lower() or 'exception' in line.lower() or 'traceback' in line.lower():
@@ -345,12 +370,14 @@ user_token = "{github_token}"
                         logger.warning(f"[PR-Agent stderr] {line}")
                     else:
                         logger.debug(f"[PR-Agent stderr] {line}")
-            
+
             if not success:
                 logger.error(f"PR-Agent failed with return code {result.returncode}")
                 if result.stderr:
                     error_snippet = result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr
                     logger.error(f"Last stderr: {error_snippet}")
+                if result.stdout and len(result.stdout) < 5000:
+                    logger.error(f"Full stdout: {result.stdout}")
             else:
                 if 'error' in (result.stderr or '').lower() or 'exception' in (result.stderr or '').lower():
                     logger.warning("PR-Agent returned 0 but stderr contains errors - may have partially failed")
