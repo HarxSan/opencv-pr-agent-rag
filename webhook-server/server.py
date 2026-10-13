@@ -363,10 +363,13 @@ def health_check():
 def webhook():
     signature = request.headers.get('X-Hub-Signature-256', '') or request.headers.get('X-Hub-Signature', '')
     
-    if config.github.webhook_secret:
-        if not verify_github_signature(request.data, signature, config.github.webhook_secret):
-            logger.warning("Invalid webhook signature")
-            return jsonify({'error': 'Invalid signature'}), 401
+    if not config.github.webhook_secret:
+        logger.error("GITHUB_WEBHOOK_SECRET is not set; refusing unsigned webhook")
+        return jsonify({'error': 'GITHUB_WEBHOOK_SECRET is not set; refusing unsigned webhooks'}), 503
+
+    if not verify_github_signature(request.data, signature, config.github.webhook_secret):
+        logger.warning("Invalid webhook signature")
+        return jsonify({'error': 'Invalid signature'}), 401
     
     event_type = request.headers.get('X-GitHub-Event', '')
     delivery_id = request.headers.get('X-GitHub-Delivery', '')
