@@ -349,7 +349,8 @@ def health_check():
         health['components']['rag'] = {'ok': False, 'message': 'Not initialized'}
     
     health['components']['model'] = {
-        'endpoint': config.model.endpoint if config else 'not configured',
+        'ok': bool(config and config.model.endpoint),
+        'endpoint': (config.model.endpoint if config else '') or 'not configured',
         'model': config.model.model_name if config else 'not configured'
     }
     
