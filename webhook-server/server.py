@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from datetime import datetime
+from functools import wraps
 from typing import Optional, Dict, Any, List
 from dataclasses import asdict
 
@@ -316,6 +317,19 @@ def process_webhook_async(event_type: str, payload: Dict[str, Any]):
         logger.error(f"Error processing webhook: {e}", exc_info=True)
 
 
+def require_admin(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        expected = os.getenv("ADMIN_TOKEN", "")
+        if not expected:
+            return jsonify({'error': 'Not found'}), 404
+        given = request.headers.get('X-Admin-Token', '')
+        if not hmac.compare_digest(given.encode(), expected.encode()):
+            return jsonify({'error': 'Forbidden'}), 403
+        return view(*args, **kwargs)
+    return wrapper
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     health = {
@@ -399,6 +413,7 @@ def webhook():
 
 
 @app.route('/test', methods=['POST'])
+@require_admin
 def test_endpoint():
     try:
         data = request.get_json()
@@ -435,6 +450,7 @@ def test_endpoint():
 
 
 @app.route('/context', methods=['POST'])
+@require_admin
 def get_context():
     try:
         data = request.get_json()

@@ -75,6 +75,7 @@ services:
       - GITHUB_APP_ID=${GITHUB_APP_ID:-}
       - GITHUB_APP_PRIVATE_KEY_PATH=/app/secrets/github-app-private-key.pem
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - GITHUB_USER_TOKEN=${GITHUB_USER_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-HarxSan/opencv}
       - LIGHTNING_AI_ENDPOINT=${LIGHTNING_AI_ENDPOINT:-https://3000-01kbs5g1xhxxrzv5rh00t479a4.cloudspaces.litng.ai}

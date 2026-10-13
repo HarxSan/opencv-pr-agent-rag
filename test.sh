@@ -74,6 +74,7 @@ echo "---------------------"
 
 RAG_TEST=$(curl -s -X POST http://localhost:5000/context \
     -H "Content-Type: application/json" \
+    -H "X-Admin-Token: ${ADMIN_TOKEN:-}" \
     -d '{
         "title": "Fix memory leak in cv::Mat",
         "description": "Fixes issue with Mat memory management",
