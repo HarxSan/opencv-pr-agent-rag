@@ -211,11 +211,10 @@ class RAGRetriever:
         module_counts: Dict[str, int] = {}
         
         for file_path in files:
-            if '/modules/' in file_path:
-                parts = file_path.split('/modules/')
-                if len(parts) > 1:
-                    module = parts[1].split('/')[0]
-                    module_counts[module] = module_counts.get(module, 0) + 1
+            parts = file_path.replace('\\', '/').split('/')
+            if "modules" in parts[:-2]:  # modules/<name>/<file>
+                module = parts[parts.index("modules") + 1]
+                module_counts[module] = module_counts.get(module, 0) + 1
         
         if module_counts:
             return max(module_counts, key=module_counts.get)
